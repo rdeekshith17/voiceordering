@@ -28,6 +28,10 @@ class FakePosError(Exception):
     pass
 
 
+class FakePosTimeout(FakePosError):
+    pass
+
+
 @dataclass
 class FakePos:
     """Copies each real POS's rules so the app is exercised before a vendor is wired up."""
@@ -37,6 +41,12 @@ class FakePos:
     tax_rate: float = 0.0875
     failure_mode: str | None = None  # "down" or "slow"
     _orders: dict[str, PosOrder] = field(default_factory=dict, repr=False)
+
+    def mark_sold_out(self, item_id: str) -> None:
+        """Simulates the POS's own stock running out since the last catalog sync."""
+        item = self.catalog.item(item_id)
+        if item is not None:
+            item.available = False
 
     def __post_init__(self) -> None:
         if self.profile not in PROFILES:
@@ -54,6 +64,8 @@ class FakePos:
     def submit(self, cart: Cart, idempotency_key: str) -> PosOrder:
         if self.failure_mode == "down":
             raise FakePosError("POS is unreachable")
+        if self.failure_mode == "slow":
+            raise FakePosTimeout("POS did not respond in time")
         if idempotency_key in self._orders:
             return self._orders[idempotency_key]
         order = PosOrder(

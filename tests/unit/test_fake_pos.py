@@ -3,7 +3,8 @@ from __future__ import annotations
 import pytest
 
 from voiceorder.core.cart import Cart
-from voiceorder.pos_adapters.fake import PROFILES, FakePos, FakePosError
+from voiceorder.core.tools import OrderTools, ToolError
+from voiceorder.pos_adapters.fake import PROFILES, FakePos, FakePosError, FakePosTimeout
 
 
 @pytest.mark.parametrize("profile", list(PROFILES))
@@ -30,6 +31,21 @@ def test_down_failure_mode_raises(catalog):
     cart = Cart(call_id="c1")
     with pytest.raises(FakePosError):
         pos.submit(cart, idempotency_key="key-1")
+
+
+def test_slow_failure_mode_raises_timeout(catalog):
+    pos = FakePos(profile="square_like", catalog=catalog, failure_mode="slow")
+    cart = Cart(call_id="c1")
+    with pytest.raises(FakePosTimeout):
+        pos.submit(cart, idempotency_key="key-1")
+
+
+def test_mark_sold_out_makes_item_unavailable(catalog):
+    pos = FakePos(profile="square_like", catalog=catalog)
+    pos.mark_sold_out("coke")
+    tools = OrderTools(cart=Cart(call_id="c1"), catalog=catalog, pos=pos)
+    with pytest.raises(ToolError):
+        tools.add_item(item_ref="coke")
 
 
 def test_square_like_uses_payment_link(catalog):
