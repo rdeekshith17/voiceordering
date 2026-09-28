@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]"
+
+      # ANTHROPIC_API_KEY is deliberately not set here: the LLM golden-caller
+      # suite (tests/golden/test_llm_golden_callers.py) skips itself without
+      # it. That's on purpose (build plan section 7) -- a free/fast tier runs
+      # on every commit, the paid LLM tier runs deliberately, not from CI.
+      - name: Test
+        run: pytest -q
