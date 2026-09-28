@@ -96,4 +96,22 @@ TOOL_SCHEMAS: list[dict] = [
             "required": ["customer_name", "confirmed"],
         },
     },
+    {
+        "name": "transfer_call",
+        "description": (
+            "Hand the call to restaurant staff. Use this when the caller directly "
+            "asks for a person, or when search_menu has returned no match twice in "
+            "a row for the same request."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Short reason, e.g. 'caller asked for a person' or 'item not found twice'.",
+                }
+            },
+            "required": ["reason"],
+        },
+    },
 ]

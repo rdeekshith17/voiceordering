@@ -109,6 +109,7 @@ def test_submit_order_succeeds_after_readback_and_yes(catalog, profile):
     tools.add_item(item_ref="churros")
     tools.get_cart()
     result = tools.submit_order(customer_name="Alex", confirmed=True)
+    assert result["status"] == "confirmed"
     assert result["order_id"]
     assert result["payment"]["kind"] in {"link", "pay_at_pickup"}
 

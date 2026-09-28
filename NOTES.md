@@ -11,7 +11,7 @@ Status snapshot against the VoiceOrderAI build plan's roadmap (section 5/6). Eac
 
 ## Phase 1 — Order engine on fakes: **done, gate closed**
 
-75 tests passing (unit + the fixed burrito-call golden script), three fake POS profiles (`square_like`/`clover_like`/`toast_like`) including `down`/`slow`/`sold_out` failure modes, and an enforced test that `core/` imports nothing but the standard library.
+Three fake POS profiles (`square_like`/`clover_like`/`toast_like`) including `down`/`slow`/`sold_out` failure modes, and an enforced test that `core/` imports nothing but the standard library. (Test count folded into Phase 4's total below — same suite, kept growing.)
 
 ## Phase 2 — Text agent and golden callers: **scaffolding done, gate not yet verified**
 
@@ -26,9 +26,18 @@ Status snapshot against the VoiceOrderAI build plan's roadmap (section 5/6). Eac
 
 Needs an ElevenLabs (or Vapi) account, a Twilio number, and an ngrok tunnel to your local API. Also gated on Phase 2's suite actually passing first.
 
-## Phase 4 — Owner app and hardening: not started
+## Phase 4 — Owner app and hardening: **mostly done, started early**
 
-Restaurant settings, a backup/order-list screen, failure handling exercised via the `slow`/`down`/`sold_out` fake POS modes already built, a transfer stub, and the security pass (section 9). Mostly code-only — doesn't strictly need external accounts, but the plan's own gating puts it after Phase 3.
+Built out of plan order — Phases 2/3's remaining gates need things only you can unblock (an API key, then voice/phone accounts), while this was genuinely code-only. 93 tests passing.
+
+- [x] Restaurant settings on `RestaurantConfig`: hours, pickup lead time, per-restaurant order limits, transfer number, voice platform choice (`voiceorder/api/main.py`)
+- [x] Backup screen: `core/backup.py` + `GET /backup-screen/{restaurant_id}` — logs unpaid (Square link orders), failed (POS down/timeout after retry), and transferred calls
+- [x] Failure handling from section 8: `search_menu` tracks misses and flags `suggest_transfer` at 2; `submit_order` retries once via a generic `PosError` and falls back to the backup screen with a reassuring message instead of raising; `transfer_call` is a real 7th tool now, wired into the prompt and schemas
+- [x] Large-order and prompt-injection guarantees (already existed from Phase 1) reconfirmed with explicit tests
+- [ ] **Tool webhook timeout + one retry** (section 8, row 5) — deliberately deferred: this needs a real HTTP layer between the voice platform and the API, which doesn't exist until Phase 5's webhooks are wired up
+- [ ] **Per-caller rate limiting** — deferred: needs `caller_number` plumbed through from a real voice adapter (Phase 5); building it against nothing meaningful now would be untested cruft
+- [ ] **Backup-screen endpoint has no auth** — fine while it's just us, but needs real owner-app auth before anyone else sees it (Phase 7 territory)
+- [ ] Caller data retention policy and the recording-consent legal wording (section 9) — these are policy/legal decisions, not code
 
 ## Phase 5 — Real adapters and webhooks: not started
 

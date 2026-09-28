@@ -36,6 +36,12 @@ class PaymentStep:
     detail: str | None = None
 
 
+class PosError(Exception):
+    """Raised by any PosAdapter when submit() fails. OrderTools retries once
+    and falls back to the backup screen on this type alone, so every adapter
+    (fake or real) must raise it rather than something vendor-specific."""
+
+
 class PosAdapter(Protocol):
     capabilities: PosCapabilities
 

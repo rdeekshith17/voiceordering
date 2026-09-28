@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import logging
 import uuid
 from dataclasses import dataclass
 
+from .backup import BackupScreen
 from .cart import CallState, Cart, CartError
 from .catalog import Catalog, Item
 from .matching import search_menu as fuzzy_search
-from .ports import PosAdapter
+from .ports import PosAdapter, PosError
+
+logger = logging.getLogger("voiceorder")
+
+SEARCH_MISSES_BEFORE_TRANSFER = 2
+POS_SUBMIT_ATTEMPTS = 2
 
 
 class ToolError(Exception):
@@ -17,17 +24,21 @@ class ToolError(Exception):
 
 @dataclass
 class OrderTools:
-    """The six tools the agent can call. Nothing reaches the POS except through here."""
+    """The tools the agent can call. Nothing reaches the POS except through here."""
 
     cart: Cart
     catalog: Catalog
     pos: PosAdapter
     max_quantity_per_line: int = 20
     max_total_cents: int = 50_000
+    backup: BackupScreen | None = None
+    transfer_number: str | None = None
 
     def search_menu(self, query: str) -> dict:
         matches = fuzzy_search(query, self.catalog)
+        self.cart.search_misses = 0 if matches else self.cart.search_misses + 1
         return {
+            "suggest_transfer": self.cart.search_misses >= SEARCH_MISSES_BEFORE_TRANSFER,
             "matches": [
                 {
                     "ref": m.item.id,
@@ -146,6 +157,24 @@ class OrderTools:
         self.cart.mark_read_back()
         return self._cart_summary(include_readback_text=True)
 
+    def transfer_call(self, reason: str) -> dict:
+        """Caller asked for a person, or search_menu kept missing (section 8)."""
+        self.cart.state = CallState.TRANSFERRED
+        cart_summary = (
+            "; ".join(line.describe() for line in self.cart.lines) or "no items yet"
+        )
+        logger.warning("call %s transferred: %s", self.cart.call_id, reason)
+        if self.backup is not None:
+            self.backup.record(
+                self.cart.call_id, "transferred", f"{reason} -- cart: {cart_summary}"
+            )
+        return {
+            "transferred": True,
+            "reason": reason,
+            "cart_summary": cart_summary,
+            "transfer_number": self.transfer_number,
+        }
+
     def submit_order(self, customer_name: str, confirmed: bool) -> dict:
         if self.cart.is_empty():
             raise ToolError("cart is empty")
@@ -161,12 +190,47 @@ class OrderTools:
             )
 
         self.cart.customer_name = customer_name
-        idempotency_key = str(uuid.uuid5(uuid.NAMESPACE_URL, self.cart.call_id))
-        order = self.pos.submit(self.cart, idempotency_key)
-        payment = self.pos.payment_step(order)
         self.cart.state = CallState.SUBMITTED
+        idempotency_key = str(uuid.uuid5(uuid.NAMESPACE_URL, self.cart.call_id))
+
+        order = None
+        last_error: PosError | None = None
+        for attempt in range(1, POS_SUBMIT_ATTEMPTS + 1):
+            try:
+                order = self.pos.submit(self.cart, idempotency_key)
+                break
+            except PosError as e:
+                last_error = e
+                logger.warning(
+                    "POS submit attempt %d/%d failed for call %s: %s",
+                    attempt,
+                    POS_SUBMIT_ATTEMPTS,
+                    self.cart.call_id,
+                    e,
+                )
+
+        if order is None:
+            if self.backup is not None:
+                self.backup.record(
+                    self.cart.call_id,
+                    "failed",
+                    f"POS submit failed after {POS_SUBMIT_ATTEMPTS} attempts: {last_error}",
+                )
+            return {
+                "status": "pending_confirmation",
+                "message": "I've saved your order and the restaurant will confirm it shortly.",
+            }
+
+        payment = self.pos.payment_step(order)
+        if payment.kind == "link" and self.backup is not None:
+            self.backup.record(
+                self.cart.call_id,
+                "unpaid",
+                f"order {order.order_id} awaiting payment via {payment.detail}",
+            )
 
         return {
+            "status": "confirmed",
             "order_id": order.order_id,
             "pickup_time": order.pickup_time,
             "payment": {"kind": payment.kind, "detail": payment.detail},

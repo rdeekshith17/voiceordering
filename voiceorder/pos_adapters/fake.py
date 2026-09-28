@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 from ..core.cart import Cart
 from ..core.catalog import Catalog
-from ..core.ports import PaymentStep, PosCapabilities, PosOrder, Totals
+from ..core.ports import PaymentStep, PosCapabilities, PosError, PosOrder, Totals
 
 PROFILES: dict[str, PosCapabilities] = {
     "square_like": PosCapabilities(
@@ -24,7 +24,7 @@ PROFILES: dict[str, PosCapabilities] = {
 }
 
 
-class FakePosError(Exception):
+class FakePosError(PosError):
     pass
 
 
@@ -40,6 +40,7 @@ class FakePos:
     catalog: Catalog
     tax_rate: float = 0.0875
     failure_mode: str | None = None  # "down" or "slow"
+    pickup_time_text: str = "20 minutes"
     _orders: dict[str, PosOrder] = field(default_factory=dict, repr=False)
 
     def mark_sold_out(self, item_id: str) -> None:
@@ -70,7 +71,7 @@ class FakePos:
             return self._orders[idempotency_key]
         order = PosOrder(
             order_id=f"{self.profile}-{len(self._orders) + 1}",
-            pickup_time="20 minutes",
+            pickup_time=self.pickup_time_text,
             raw={},
         )
         self._orders[idempotency_key] = order

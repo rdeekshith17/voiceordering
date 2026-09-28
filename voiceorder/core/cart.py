@@ -49,6 +49,7 @@ class Cart:
     needs_readback: bool = False
     customer_name: str | None = None
     customer_phone: str | None = None
+    search_misses: int = 0
     _next_line_id: int = field(default=1, repr=False)
 
     def add_line(self, **kwargs) -> CartLine:
