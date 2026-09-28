@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from enum import Enum
+from typing import Any
 
 
 class CallState(str, Enum):
@@ -84,3 +85,32 @@ class Cart:
 
     def is_empty(self) -> bool:
         return len(self.lines) == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        """Round-trips through a session store (Redis in production, an
+        in-memory dict for local dev and tests) between requests in the
+        same call -- the cart is the only thing that needs to survive."""
+        return {
+            "call_id": self.call_id,
+            "lines": [asdict(line) for line in self.lines],
+            "state": self.state.value,
+            "needs_readback": self.needs_readback,
+            "customer_name": self.customer_name,
+            "customer_phone": self.customer_phone,
+            "search_misses": self.search_misses,
+            "next_line_id": self._next_line_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Cart:
+        cart = cls(
+            call_id=data["call_id"],
+            state=CallState(data["state"]),
+            needs_readback=data["needs_readback"],
+            customer_name=data.get("customer_name"),
+            customer_phone=data.get("customer_phone"),
+            search_misses=data.get("search_misses", 0),
+        )
+        cart.lines = [CartLine(**line) for line in data["lines"]]
+        cart._next_line_id = data["next_line_id"]
+        return cart

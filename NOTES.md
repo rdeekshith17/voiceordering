@@ -2,6 +2,19 @@
 
 Status snapshot against the VoiceOrderAI build plan's roadmap (section 5/6). Each item is tagged with who unblocks it next.
 
+## Production hardening (beyond the plan's phases, started at your request)
+
+- [x] **CI**: GitHub Actions (`.github/workflows/ci.yml`) runs the full free test tier on every push/PR, Python 3.11 + 3.12, plus a real `postgres:16` service container so the Postgres-backed tests run for real in CI, not just skip. Verified green: https://github.com/rdeekshith17/voiceordering/actions
+- [x] **Real persistence**: `_sessions`/in-memory-only `BackupScreen` replaced with a swappable-store architecture, same fakes-first pattern as the POS/voice adapters:
+  - `voiceorder/storage/cart_store.py` — `CartStore` port. `InMemoryCartStore` is the default (what every test uses); `RedisCartStore` is real, selected by setting `VOICEORDER_REDIS_URL`. The live cart now round-trips through `Cart.to_dict()`/`from_dict()` on every request instead of living in a Python dict in the API process.
+  - `voiceorder/storage/postgres_backup.py` — `PostgresBackupStore`, selected by setting `VOICEORDER_DATABASE_URL`. Verified against a real throwaway local Postgres during development (not just written blind), and now covered continuously by CI's postgres service container.
+  - `core/backup.py` gained a `"confirmed"` entry kind — every submitted order is now logged, not just the unpaid/failed/transferred ones.
+  - Neither is required for local dev or `pytest` — both env vars are unset by default, so everything still runs against the in-memory versions with zero setup.
+  - `docker-compose.yml` added for running real Postgres + Redis locally (needs Docker Desktop running — it's installed on this machine but wasn't started).
+- [ ] Containerize the app itself (Dockerfile) + a proper settings module replacing scattered `os.environ.get` calls — not started yet.
+
+## Plan phases
+
 ## Phase 0 — Groundwork
 
 - [x] Square adapter scaffold, normalized schema, tests, CI
@@ -28,7 +41,7 @@ Needs an ElevenLabs (or Vapi) account, a Twilio number, and an ngrok tunnel to y
 
 ## Phase 4 — Owner app and hardening: **mostly done, started early**
 
-Built out of plan order — Phases 2/3's remaining gates need things only you can unblock (an API key, then voice/phone accounts), while this was genuinely code-only. 93 tests passing.
+Built out of plan order — Phases 2/3's remaining gates need things only you can unblock (an API key, then voice/phone accounts), while this was genuinely code-only. 105 tests passing (test count keeps growing — see the persistence section above too).
 
 - [x] Restaurant settings on `RestaurantConfig`: hours, pickup lead time, per-restaurant order limits, transfer number, voice platform choice (`voiceorder/api/main.py`)
 - [x] Backup screen: `core/backup.py` + `GET /backup-screen/{restaurant_id}` — logs unpaid (Square link orders), failed (POS down/timeout after retry), and transferred calls

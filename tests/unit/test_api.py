@@ -11,7 +11,7 @@ DEMO_NUMBER = "+15551234567"
 @pytest.fixture
 def client(monkeypatch):
     monkeypatch.delenv("VOICEORDER_WEBHOOK_SECRET", raising=False)
-    api_main._sessions.clear()
+    api_main._cart_store._data.clear()
     for screen in api_main._backup_screens.values():
         screen.entries.clear()
     return TestClient(api_main.app)

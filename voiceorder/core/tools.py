@@ -4,7 +4,7 @@ import logging
 import uuid
 from dataclasses import dataclass
 
-from .backup import BackupScreen
+from .backup import BackupStore
 from .cart import CallState, Cart, CartError
 from .catalog import Catalog, Item
 from .matching import search_menu as fuzzy_search
@@ -31,7 +31,7 @@ class OrderTools:
     pos: PosAdapter
     max_quantity_per_line: int = 20
     max_total_cents: int = 50_000
-    backup: BackupScreen | None = None
+    backup: BackupStore | None = None
     transfer_number: str | None = None
 
     def search_menu(self, query: str) -> dict:
@@ -222,12 +222,16 @@ class OrderTools:
             }
 
         payment = self.pos.payment_step(order)
-        if payment.kind == "link" and self.backup is not None:
+        if self.backup is not None:
             self.backup.record(
-                self.cart.call_id,
-                "unpaid",
-                f"order {order.order_id} awaiting payment via {payment.detail}",
+                self.cart.call_id, "confirmed", f"order {order.order_id} submitted"
             )
+            if payment.kind == "link":
+                self.backup.record(
+                    self.cart.call_id,
+                    "unpaid",
+                    f"order {order.order_id} awaiting payment via {payment.detail}",
+                )
 
         return {
             "status": "confirmed",

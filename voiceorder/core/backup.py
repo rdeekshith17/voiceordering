@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Protocol
 
-# The kinds from section 8: an order that's sitting unpaid (Square, before the
-# link is paid), one the POS never accepted after a retry, or a call that got
-# handed to staff. Every failure in the plan lands in exactly one of these
-# instead of a silent line or a phantom order.
-BackupKind = str  # "unpaid" | "failed" | "transferred"
+# "confirmed" is every order that reached the POS; "unpaid" additionally marks
+# a confirmed Square order still waiting on its payment link; "failed" is one
+# the POS never accepted after a retry; "transferred" is a call handed to
+# staff. Every failure in section 8 lands in exactly one of these instead of
+# a silent line or a phantom order.
+BackupKind = str  # "confirmed" | "unpaid" | "failed" | "transferred"
 
 
 @dataclass
@@ -16,6 +18,16 @@ class BackupEntry:
     kind: BackupKind
     detail: str
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+class BackupStore(Protocol):
+    """What OrderTools writes order events to. The in-memory BackupScreen
+    below is the default (and what every test uses); storage/postgres_backup.py
+    has the real, Postgres-backed implementation for when a restaurant's
+    order history needs to survive a restart."""
+
+    def record(self, call_id: str, kind: BackupKind, detail: str) -> BackupEntry: ...
+    def list_entries(self, kind: BackupKind | None = None) -> list[BackupEntry]: ...
 
 
 @dataclass
