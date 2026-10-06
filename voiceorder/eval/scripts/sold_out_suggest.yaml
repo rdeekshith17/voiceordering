@@ -1,0 +1,18 @@
+id: sold_out_suggest
+description: First pick is sold out; agent suggests an alternative.
+persona: Easygoing caller.
+pos_setup:
+  mode: ok
+  sold_out: [B1]
+turns:
+  - caller: "A chicken burrito please."
+  - caller: "Okay, steak burrito then. Rice and beans."
+  - caller: "Yes. Nina, 555-000-1111."
+expected_cart:
+  - item_ref: B2
+    quantity: 1
+    variation_id: null
+    modifier_ids: [burrito_rice_beans]
+    note: null
+expected_submit: true
+expected_transfer: false

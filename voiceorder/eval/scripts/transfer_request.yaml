@@ -1,0 +1,8 @@
+id: transfer_request
+description: Caller explicitly asks for a person.
+persona: Caller who prefers humans.
+turns:
+  - caller: "Let me talk to a person please."
+expected_cart: []
+expected_submit: false
+expected_transfer: true

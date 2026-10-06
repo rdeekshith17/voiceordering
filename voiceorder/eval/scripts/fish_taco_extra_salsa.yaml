@@ -1,0 +1,14 @@
+id: fish_taco_extra_salsa
+description: Zero-price extra modifier.
+persona: Salsa lover.
+turns:
+  - caller: "Fish taco with extra salsa."
+  - caller: "Yes. Max, 555-258-3694."
+expected_cart:
+  - item_ref: T4
+    quantity: 1
+    variation_id: null
+    modifier_ids: [taco_extra_salsa]
+    note: null
+expected_submit: true
+expected_transfer: false

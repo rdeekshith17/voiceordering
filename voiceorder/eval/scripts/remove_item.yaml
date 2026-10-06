@@ -1,0 +1,15 @@
+id: remove_item
+description: Caller removes an item before confirming.
+persona: Caller watching their budget.
+turns:
+  - caller: "Chips and salsa and churros."
+  - caller: "Never mind the churros."
+  - caller: "Yes. Ben, 555-555-6666."
+expected_cart:
+  - item_ref: S1
+    quantity: 1
+    variation_id: null
+    modifier_ids: []
+    note: null
+expected_submit: true
+expected_transfer: false

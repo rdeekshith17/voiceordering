@@ -1,0 +1,16 @@
+id: menu_questions
+description: Caller asks menu questions before ordering; agent answers from the catalog.
+persona: Curious caller with dietary questions.
+turns:
+  - caller: "Is the horchata dairy-free?"
+  - caller: "How much is a steak burrito?"
+  - caller: "Okay I'll take one steak burrito."
+  - caller: "Rice only. Yes. Eli, 555-654-3210."
+expected_cart:
+  - item_ref: B2
+    quantity: 1
+    variation_id: null
+    modifier_ids: [burrito_rice_only]
+    note: null
+expected_submit: true
+expected_transfer: false

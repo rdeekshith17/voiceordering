@@ -1,0 +1,19 @@
+id: veggie_bowl_custom
+description: Required base choice plus a sized drink in one breath.
+persona: Regular who orders fast.
+turns:
+  - caller: "Veggie bowl, no rice extra lettuce, and a jamaica."
+  - caller: "Large jamaica. Yes. Rin, 555-159-7534."
+expected_cart:
+  - item_ref: W3
+    quantity: 1
+    variation_id: null
+    modifier_ids: [bowl_lettuce]
+    note: null
+  - item_ref: D2
+    quantity: 1
+    variation_id: large
+    modifier_ids: []
+    note: null
+expected_submit: true
+expected_transfer: false

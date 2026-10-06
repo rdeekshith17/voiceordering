@@ -1,0 +1,14 @@
+id: price_check
+description: Caller asks the price before committing.
+persona: Budget-conscious caller.
+turns:
+  - caller: "How much for two steak tacos?"
+  - caller: "Okay, I'll take them. Yes. Ivy, 555-147-2583."
+expected_cart:
+  - item_ref: T2
+    quantity: 2
+    variation_id: null
+    modifier_ids: []
+    note: null
+expected_submit: true
+expected_transfer: false

@@ -1,0 +1,29 @@
+id: family_order
+description: Larger multi-line order with modifiers and sizes.
+persona: Parent ordering for the family.
+turns:
+  - caller: "Four chicken tacos, two steak tacos with guac, two large horchatas, and churros."
+  - caller: "Yes. Family name Garcia, 555-246-8101."
+expected_cart:
+  - item_ref: T1
+    quantity: 4
+    variation_id: null
+    modifier_ids: []
+    note: null
+  - item_ref: T2
+    quantity: 2
+    variation_id: null
+    modifier_ids: [taco_guac]
+    note: null
+  - item_ref: D1
+    quantity: 2
+    variation_id: large
+    modifier_ids: []
+    note: null
+  - item_ref: S4
+    quantity: 1
+    variation_id: null
+    modifier_ids: []
+    note: null
+expected_submit: true
+expected_transfer: false

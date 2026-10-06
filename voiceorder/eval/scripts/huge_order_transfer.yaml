@@ -1,0 +1,8 @@
+id: huge_order_transfer
+description: 40 burritos exceeds the per-line limit. Agent must transfer.
+persona: Office manager ordering for a team lunch.
+turns:
+  - caller: "I need 40 chicken burritos for the office."
+expected_cart: []
+expected_submit: false
+expected_transfer: true

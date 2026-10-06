@@ -1,0 +1,19 @@
+id: drink_sizes
+description: Size variations on drinks.
+persona: Thirsty caller.
+turns:
+  - caller: "A large horchata and a regular coke."
+  - caller: "Yes. Ada, 555-321-6547."
+expected_cart:
+  - item_ref: D1
+    quantity: 1
+    variation_id: large
+    modifier_ids: []
+    note: null
+  - item_ref: D3
+    quantity: 1
+    variation_id: regular
+    modifier_ids: []
+    note: null
+expected_submit: true
+expected_transfer: false

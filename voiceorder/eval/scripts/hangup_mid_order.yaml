@@ -1,0 +1,19 @@
+id: hangup_mid_order
+description: Caller hangs up before confirming. Nothing is submitted.
+persona: Caller who gets interrupted mid-call.
+turns:
+  - caller: "Two chicken tacos and a horchata."
+  - hangup: true
+expected_cart:
+  - item_ref: T1
+    quantity: 2
+    variation_id: null
+    modifier_ids: []
+    note: null
+  - item_ref: D1
+    quantity: 1
+    variation_id: regular
+    modifier_ids: []
+    note: null
+expected_submit: false
+expected_transfer: false

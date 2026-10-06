@@ -1,0 +1,15 @@
+id: misheard_chiken
+description: Misheard item name; fuzzy match should still find it.
+persona: Caller on a bad connection.
+turns:
+  - caller: "One chiken burrito."
+  - caller: "Rice and beans."
+  - caller: "Yes. Kim, 555-135-7924."
+expected_cart:
+  - item_ref: B1
+    quantity: 1
+    variation_id: null
+    modifier_ids: [burrito_rice_beans]
+    note: null
+expected_submit: true
+expected_transfer: false

@@ -1,0 +1,35 @@
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: voiceorder:latest
+    # All secrets/config live here (copy deploy/.env.production.example -> .env.production and fill in).
+    # Never commit the filled-in file.
+    env_file:
+      - .env.production
+    environment:
+      # Inside the container the data dir is always /app/data.
+      - VOICEORDER_DB=/app/data/voiceorder.db
+      - TTS_CACHE_DIR=/app/.tts_cache
+    volumes:
+      # Named volume holds everything that must survive redeploys:
+      # SQLite DB (tenants, orders, encrypted POS creds), backups/, menu cache, TTS cache.
+      - voiceorder-data:/app/data
+      - voiceorder-tts:/app/.tts_cache
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).status==200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+volumes:
+  voiceorder-data:
+    name: voiceorder-data
+  voiceorder-tts:
+    name: voiceorder-tts

@@ -1,0 +1,8 @@
+id: greeting_hangup
+description: Caller hangs up right after the greeting. Nothing happens.
+persona: Butt-dial.
+turns:
+  - hangup: true
+expected_cart: []
+expected_submit: false
+expected_transfer: false

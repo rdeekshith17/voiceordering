@@ -1,0 +1,10 @@
+id: unknown_item_twice_transfer
+description: Item not on the menu, misheard twice, agent must offer a transfer.
+persona: Caller craving pizza from a taqueria.
+turns:
+  - caller: "Do you have pepperoni pizza?"
+  - caller: "What about a pepperoni pizza, large?"
+  - caller: "Yes please connect me."
+expected_cart: []
+expected_submit: false
+expected_transfer: true

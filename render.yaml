@@ -1,0 +1,44 @@
+# VoiceOrderAI — Render one-click deploy (free tier, fine for testing).
+# Usage: push this repo to GitHub, then in Render: New > Blueprint > select repo.
+# Fill the empty env values in the Render dashboard (never commit secrets).
+services:
+  - type: web
+    name: voiceorderai
+    runtime: docker
+    dockerfilePath: ./deploy/Dockerfile
+    dockerContext: .
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PUBLIC_BASE_URL
+        sync: false # paste your Render URL after first deploy, e.g. https://voiceorderai.onrender.com
+      - key: VOICE_SECRET
+        generateValue: true
+      - key: OWNER_SECRET
+        generateValue: true # owner dashboard (/owner) + portal password — copy from dashboard
+      - key: TENANT_MASTER_KEY
+        generateValue: true # encrypts tenant POS secrets; must stay stable
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: ANTHROPIC_MODEL
+        value: claude-haiku-4-5-20251001
+      - key: ELEVENLABS_API_KEY
+        sync: false # free plan is fine
+      - key: TWILIO_ACCOUNT_SID
+        sync: false # from Twilio console
+      - key: TWILIO_AUTH_TOKEN
+        sync: false # from Twilio console; turns on webhook signature validation
+      - key: TWILIO_PHONE_NUMBER
+        value: +15622680097
+      - key: RESTAURANT_NAME
+        value: Hyderabad House
+      - key: POS_PROFILE
+        value: square
+      - key: SQUARE_LOCATION_ID
+        value: LP080BBB3A045
+      - key: SQUARE_ENVIRONMENT
+        value: production
+      - key: SQUARE_MENU_SYNC
+        value: 1
+      - key: TTS_ENABLED
+        value: 1

@@ -1,131 +1,182 @@
+"""Tool tests, run against every fake POS profile.
+
+Phase 1 gate: all seven tools behave on square_like, clover_like, and toast_like.
+"""
 from __future__ import annotations
 
 import pytest
 
-from voiceorder.core.cart import Cart
-from voiceorder.core.tools import OrderTools, ToolError
-from voiceorder.pos_adapters.fake import PROFILES, FakePos
-
-PROFILE_NAMES = list(PROFILES)
-
-
-def make_tools(catalog, profile: str, call_id: str = "call-1") -> OrderTools:
-    pos = FakePos(profile=profile, catalog=catalog)
-    return OrderTools(cart=Cart(call_id=call_id), catalog=catalog, pos=pos)
+from voiceorder.core import tools
+from voiceorder.core.cart import CartState
+from voiceorder.core.ports import PosError
+from voiceorder.pos_adapters.fake import FakePos
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_add_item_prices_from_catalog(catalog, profile):
-    tools = make_tools(catalog, profile)
-    result = tools.add_item(item_ref="burrito-chicken", quantity=2)
-    assert result["cart"]["lines"][0]["quantity"] == 2
-    assert result["cart"]["subtotal_cents"] == 1900
-
-
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_add_item_with_size_and_modifiers(catalog, profile):
-    tools = make_tools(catalog, profile)
-    result = tools.add_item(
-        item_ref="horchata", variation_ref="large", modifier_refs=[]
+def run(pos, cart, catalog, ctx, name, **arguments):
+    return tools.dispatch(
+        name, cart=cart, catalog=catalog, pos=pos, ctx=ctx, arguments=arguments
     )
-    assert result["cart"]["subtotal_cents"] == 450
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_add_item_unknown_ref_raises(catalog, profile):
-    tools = make_tools(catalog, profile)
-    with pytest.raises(ToolError):
-        tools.add_item(item_ref="pizza-slice")
+def add_burrito(pos, cart, catalog, ctx, ref="B1", qty=2):
+    return run(
+        pos, cart, catalog, ctx, "add_item",
+        item_ref=ref, quantity=qty, modifier_ids=["burrito_rice_beans"],
+    )
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_add_item_quantity_over_limit_raises(catalog, profile):
-    tools = make_tools(catalog, profile)
-    with pytest.raises(ToolError):
-        tools.add_item(item_ref="burrito-chicken", quantity=999)
+def test_full_order_flow(pos, cart, catalog, ctx):
+    assert run(pos, cart, catalog, ctx, "search_menu", query="chicken burrito").ok
+    result = add_burrito(pos, cart, catalog, ctx)
+    assert result.ok, result.message
+    line_id = result.data["line_id"]
+
+    result = run(pos, cart, catalog, ctx, "update_item", line_id=line_id, quantity=1)
+    assert result.ok
+
+    result = run(pos, cart, catalog, ctx, "get_cart")
+    assert result.ok
+    assert cart.state == CartState.READ_BACK
+    assert "total" in result.message.lower() or "$" in result.message
+    total = result.data["totals"]["total"]
+    assert total == round(9.50 * 1.0825, 2)
+
+    result = run(
+        pos, cart, catalog, ctx, "submit_order",
+        customer_name="Deekshith", customer_phone="+15551234567", confirmed=True,
+    )
+    assert result.ok, result.message
+    order = result.data["order"]
+    assert order["order_number"]
+    assert order["pickup_time"]
+    if pos.profile == "square_like":
+        assert order["payment"]["kind"] == "link"
+        assert order["payment"]["url"]
+        assert order["status"] == "pending_payment"
+    else:
+        assert order["payment"]["kind"] == "pay_at_pickup"
+        assert order["status"] == "received"
+    assert cart.state == CartState.SUBMITTED
 
 
-def test_clover_rejects_modifiers_not_linked_to_item(catalog):
-    tools = make_tools(catalog, "clover_like")
-    with pytest.raises(ToolError):
-        tools.add_item(item_ref="water", modifier_refs=["no-onions"])
+def test_submit_requires_read_back_and_yes(pos, cart, catalog, ctx):
+    add_burrito(pos, cart, catalog, ctx)
+    result = run(
+        pos, cart, catalog, ctx, "submit_order",
+        customer_name="Deekshith", customer_phone="+15551234567", confirmed=True,
+    )
+    assert not result.ok
+    assert result.error_code == "read_back_required"
+
+    run(pos, cart, catalog, ctx, "get_cart")
+    result = run(
+        pos, cart, catalog, ctx, "submit_order",
+        customer_name="Deekshith", customer_phone="+15551234567", confirmed=False,
+    )
+    assert not result.ok
+    assert result.error_code == "not_confirmed"
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_update_item_changes_quantity(catalog, profile):
-    tools = make_tools(catalog, profile)
-    add_result = tools.add_item(item_ref="burrito-steak", quantity=1)
-    line_id = add_result["line_id"]
-    update_result = tools.update_item(line_id=line_id, quantity=3)
-    assert update_result["cart"]["lines"][0]["quantity"] == 3
+def test_submit_needs_customer_details(pos, cart, catalog, ctx):
+    add_burrito(pos, cart, catalog, ctx)
+    run(pos, cart, catalog, ctx, "get_cart")
+    result = run(pos, cart, catalog, ctx, "submit_order", confirmed=True)
+    assert not result.ok
+    assert result.error_code == "missing_customer"
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_update_item_changes_size(catalog, profile):
-    tools = make_tools(catalog, profile)
-    add_result = tools.add_item(item_ref="coke", variation_ref="small")
-    line_id = add_result["line_id"]
-    update_result = tools.update_item(line_id=line_id, variation_ref="large")
-    assert update_result["cart"]["subtotal_cents"] == 325
+def test_unknown_item(pos, cart, catalog, ctx):
+    result = run(pos, cart, catalog, ctx, "add_item", item_ref="ZZ9", quantity=1)
+    assert not result.ok
+    assert result.error_code == "unknown_item"
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_remove_item(catalog, profile):
-    tools = make_tools(catalog, profile)
-    add_result = tools.add_item(item_ref="churros")
-    tools.remove_item(line_id=add_result["line_id"])
-    assert tools.cart.is_empty()
+def test_required_modifier_group_enforced(pos, cart, catalog, ctx):
+    # Burritos require a Rice & Beans choice.
+    result = run(pos, cart, catalog, ctx, "add_item", item_ref="B1", quantity=1)
+    assert not result.ok
+    assert result.error_code == "invalid_selection"
+    assert "Rice & Beans" in result.message
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_get_cart_returns_readback_text_and_clears_flag(catalog, profile):
-    tools = make_tools(catalog, profile)
-    tools.add_item(item_ref="churros")
-    result = tools.get_cart()
-    assert "readback_text" in result
-    assert tools.cart.needs_readback is False
+def test_sold_out_item_refused(cart, catalog, ctx):
+    sold_out_pos = FakePos(profile="square_like", catalog=catalog)
+    sold_out_pos.mark_sold_out("B1")
+    result = run(
+        sold_out_pos, cart, catalog, ctx, "add_item",
+        item_ref="B1", quantity=1, modifier_ids=["burrito_rice_beans"],
+    )
+    assert not result.ok
+    assert result.error_code == "sold_out"
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_submit_order_requires_readback(catalog, profile):
-    tools = make_tools(catalog, profile)
-    tools.add_item(item_ref="churros")
-    with pytest.raises(ToolError):
-        tools.submit_order(customer_name="Alex", confirmed=True)
+def test_pos_down_lands_on_backup_screen(cart, catalog, ctx):
+    down_pos = FakePos(profile="square_like", catalog=catalog, mode="down")
+    add_burrito(down_pos, cart, catalog, ctx)  # add fails closed on availability
+    assert cart.is_empty()
+    # Pretend the cart was built before the outage, then quote/submit fail.
+    cart.add_line(item_ref="B1", item_name="Chicken Burrito", quantity=1, unit_price=9.50)
+    result = run(down_pos, cart, catalog, ctx, "get_cart")
+    assert not result.ok
+    assert result.error_code == "pos_unavailable"
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_submit_order_requires_confirmation(catalog, profile):
-    tools = make_tools(catalog, profile)
-    tools.add_item(item_ref="churros")
-    tools.get_cart()
-    with pytest.raises(ToolError):
-        tools.submit_order(customer_name="Alex", confirmed=False)
+def test_idempotent_submit(pos, cart, catalog, ctx):
+    add_burrito(pos, cart, catalog, ctx)
+    run(pos, cart, catalog, ctx, "get_cart")
+    args = dict(
+        customer_name="Deekshith", customer_phone="+15551234567", confirmed=True,
+        idempotency_key="same-key-123",
+    )
+    first = run(pos, cart, catalog, ctx, "submit_order", **args)
+    second = run(pos, cart, catalog, ctx, "submit_order", **args)
+    assert first.ok and second.ok
+    assert first.data["order"]["order_id"] == second.data["order"]["order_id"]
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_submit_order_succeeds_after_readback_and_yes(catalog, profile):
-    tools = make_tools(catalog, profile)
-    tools.add_item(item_ref="churros")
-    tools.get_cart()
-    result = tools.submit_order(customer_name="Alex", confirmed=True)
-    assert result["status"] == "confirmed"
-    assert result["order_id"]
-    assert result["payment"]["kind"] in {"link", "pay_at_pickup"}
+def test_change_after_read_back_requires_new_read_back(pos, cart, catalog, ctx):
+    add_burrito(pos, cart, catalog, ctx)
+    run(pos, cart, catalog, ctx, "get_cart")
+    line_id = cart.lines[0].line_id
+    run(pos, cart, catalog, ctx, "update_item", line_id=line_id, quantity=3)
+    assert cart.state == CartState.BUILDING
+    result = run(
+        pos, cart, catalog, ctx, "submit_order",
+        customer_name="Deekshith", customer_phone="+15551234567", confirmed=True,
+    )
+    assert not result.ok
+    assert result.error_code == "read_back_required"
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_submit_order_rejects_empty_cart(catalog, profile):
-    tools = make_tools(catalog, profile)
-    with pytest.raises(ToolError):
-        tools.submit_order(customer_name="Alex", confirmed=True)
+def test_swap_item_on_line(pos, cart, catalog, ctx):
+    result = add_burrito(pos, cart, catalog, ctx)
+    line_id = result.data["line_id"]
+    # "actually make one of them steak"
+    result = run(
+        pos, cart, catalog, ctx, "update_item",
+        line_id=line_id, item_ref="B2", modifier_ids=["burrito_rice_beans"],
+    )
+    assert result.ok, result.message
+    assert cart.lines[0].item_ref == "B2"
+    assert cart.lines[0].unit_price == 10.50
 
 
-@pytest.mark.parametrize("profile", PROFILE_NAMES)
-def test_large_order_is_rejected_for_transfer(catalog, profile):
-    tools = make_tools(catalog, profile)
-    tools.max_total_cents = 1000
-    tools.add_item(item_ref="burrito-steak", quantity=5)
-    tools.get_cart()
-    with pytest.raises(ToolError):
-        tools.submit_order(customer_name="Alex", confirmed=True)
+def test_toast_requires_quote_before_submit(cart, catalog, ctx):
+    toast = FakePos(profile="toast_like", catalog=catalog)
+    cart.add_line(item_ref="B1", item_name="Chicken Burrito", quantity=1, unit_price=9.50)
+    with pytest.raises(PosError):
+        toast.submit(cart, "key-no-quote")
+    toast.quote(cart)  # the supported path
+    order = toast.submit(cart, "key-no-quote")
+    assert order.status == "received"
+
+
+def test_clover_rejects_unlinked_modifier(cart, catalog, ctx):
+    clover = FakePos(profile="clover_like", catalog=catalog)
+    line = cart.add_line(
+        item_ref="B1", item_name="Chicken Burrito", quantity=1, unit_price=9.50,
+        modifier_ids=["ques_guac"],  # a quesadilla modifier smuggled onto a burrito
+    )
+    assert line is not None
+    with pytest.raises(PosError):
+        clover.submit(cart, "key-bad-mod")

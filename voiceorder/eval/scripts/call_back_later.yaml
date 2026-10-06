@@ -1,0 +1,9 @@
+id: call_back_later
+description: Caller bails before ordering. Nothing submitted.
+persona: Caller who got distracted.
+turns:
+  - caller: "Actually I'll call back later."
+  - hangup: true
+expected_cart: []
+expected_submit: false
+expected_transfer: false

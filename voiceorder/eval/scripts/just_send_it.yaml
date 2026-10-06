@@ -1,0 +1,15 @@
+id: just_send_it
+description: Caller says "just send it" without a read-back; agent must still read back first.
+persona: Impatient caller.
+turns:
+  - caller: "Chicken burrito. Just send it."
+  - caller: "Rice and beans."
+  - caller: "Yes. Leo, 555-369-2581."
+expected_cart:
+  - item_ref: B1
+    quantity: 1
+    variation_id: null
+    modifier_ids: [burrito_rice_beans]
+    note: null
+expected_submit: true
+expected_transfer: false

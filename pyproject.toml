@@ -1,29 +1,28 @@
 [project]
 name = "voiceorder"
-version = "0.1.0"
-description = "VoiceOrderAI order engine"
-requires-python = ">=3.11"
+version = "0.3.0"
+description = "VoiceOrderAI: voice-driven phone ordering engine (text agent + eval harness)"
+requires-python = ">=3.10"
 dependencies = [
-    "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "httpx>=0.27",
+    "pyyaml>=6",
     "anthropic>=0.40",
-    "redis>=5.0",
-    "psycopg2-binary>=2.9",
+    "python-multipart>=0.0.9",  # Twilio webhooks post form-encoded bodies
+    "cryptography>=40",  # Fernet encryption for tenant POS secrets at rest
 ]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=8.0",
-    "httpx>=0.27",
-    "fakeredis>=2.20",
-]
+dev = ["pytest>=8"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
+where = ["."]
 include = ["voiceorder*"]

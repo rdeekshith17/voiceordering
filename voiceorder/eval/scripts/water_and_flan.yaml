@@ -1,0 +1,19 @@
+id: water_and_flan
+description: Dessert plus drink, no modifiers or sizes involved.
+persona: Caller with a sweet tooth.
+turns:
+  - caller: "A flan and a bottled water."
+  - caller: "Yes. Noah, 555-654-9871."
+expected_cart:
+  - item_ref: F1
+    quantity: 1
+    variation_id: null
+    modifier_ids: []
+    note: null
+  - item_ref: D5
+    quantity: 1
+    variation_id: null
+    modifier_ids: []
+    note: null
+expected_submit: true
+expected_transfer: false

@@ -1,0 +1,16 @@
+id: readback_correction
+description: Caller corrects the order after the read-back; agent must read back again.
+persona: Caller who spots a mistake in the read-back.
+turns:
+  - caller: "Chicken burrito and a coke."
+  - caller: "Rice and beans, regular coke."
+  - caller: "Yes... wait, no, remove the coke."
+  - caller: "Yes that's right. Mia, 555-789-0123."
+expected_cart:
+  - item_ref: B1
+    quantity: 1
+    variation_id: null
+    modifier_ids: [burrito_rice_beans]
+    note: null
+expected_submit: true
+expected_transfer: false

@@ -1,0 +1,15 @@
+id: quantity_change
+description: Caller changes a quantity before confirming.
+persona: Caller doing mental math out loud.
+turns:
+  - caller: "Three chicken tacos."
+  - caller: "Actually make that two."
+  - caller: "Yes. Sam, 555-111-2222."
+expected_cart:
+  - item_ref: T1
+    quantity: 2
+    variation_id: null
+    modifier_ids: []
+    note: null
+expected_submit: true
+expected_transfer: false

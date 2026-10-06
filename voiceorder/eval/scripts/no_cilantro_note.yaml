@@ -1,0 +1,14 @@
+id: no_cilantro_note
+description: Zero-price modifier plus a free-text kitchen note.
+persona: Picky eater with a spice tolerance.
+turns:
+  - caller: "One carnitas taco, no cilantro, extra spicy please."
+  - caller: "Yes. Luis, 555-222-3333."
+expected_cart:
+  - item_ref: T3
+    quantity: 1
+    variation_id: null
+    modifier_ids: [taco_no_cilantro]
+    note: extra spicy
+expected_submit: true
+expected_transfer: false

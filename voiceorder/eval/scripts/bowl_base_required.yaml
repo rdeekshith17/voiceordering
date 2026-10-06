@@ -1,0 +1,15 @@
+id: bowl_base_required
+description: Bowl needs a required base choice; agent must ask.
+persona: Health-conscious caller.
+turns:
+  - caller: "A steak bowl."
+  - caller: "No rice, extra lettuce."
+  - caller: "Yes. Raj, 555-456-7890."
+expected_cart:
+  - item_ref: W2
+    quantity: 1
+    variation_id: null
+    modifier_ids: [bowl_lettuce]
+    note: null
+expected_submit: true
+expected_transfer: false
