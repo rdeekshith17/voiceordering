@@ -19,7 +19,6 @@ EOF
 
 # Copy the application
 COPY voiceorder ./voiceorder
-COPY fixtures ./fixtures
 COPY deploy/seed.py ./deploy/seed.py
 
 # Writable runtime dirs (mounted as a volume in production)
