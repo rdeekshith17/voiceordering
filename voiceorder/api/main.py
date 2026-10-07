@@ -683,9 +683,15 @@ def _twilio_signature_ok(request: Request, form: dict[str, str]) -> bool:
             "accepting Twilio webhook without signature validation (dev only)"
         )
         return True
-    signature = request.headers.get("x-twilio-signature", "")
-    url = f"{public_base}{request.url.path}"
-    return twilio_adapter.validate_signature(url, form, signature, token)
+        signature = request.headers.get("x-twilio-signature", "")
+        url = f"{public_base}{request.url.path}"
+        # Twilio signs the full URL *including* the query string (e.g.
+        # /twilio/turn?id=...&sid=...&n=0). Omitting it breaks validation on
+        # every poll request and the caller hears Twilio's "application error".
+        if request.url.query:
+            url = f"{url}?{request.url.query}"
+        return twilio_adapter.validate_signature(url, form, signature, token)
+
 
 
 def _public_base_url() -> str:
