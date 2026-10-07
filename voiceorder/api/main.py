@@ -33,7 +33,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from xml.sax.saxutils import escape as _xml_escape
+
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -845,7 +846,7 @@ async def twilio_gather(request: Request) -> Response:
         daemon=True,
     ).start()
     base = _public_base_url()
-    poll_url = f"{base}/twilio/turn?id={turn_id}&sid={call_sid}&n=0"
+    poll_url = _xml_escape(f"{base}/twilio/turn?id={turn_id}&sid={call_sid}&n=0")
     # Plain <Say> filler: no TTS latency, answers in milliseconds.
     return _twiml_response(
         f'<?xml version="1.0" encoding="UTF-8"?><Response>'
@@ -921,7 +922,7 @@ async def twilio_turn(request: Request) -> Response:
                     gather_url,
                 )
             )
-        poll_url = f"{base}/twilio/turn?id={turn_id}&sid={call_sid}&n={poll_n + 1}"
+        poll_url = _xml_escape(     f"{base}/twilio/turn?id={turn_id}&sid={call_sid}&n={poll_n + 1}" )
         return _twiml_response(
             f'<?xml version="1.0" encoding="UTF-8"?><Response>'
             f'<Pause length="1"/>'
