@@ -6,11 +6,17 @@ a tenant can only ever see their own calls, orders, and settings.
 """
 from __future__ import annotations
 
+import csv
 import html
+import io
+import json
 import logging
 import time
+import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta, tzinfo
 from typing import Any, Callable
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -20,6 +26,8 @@ from ..tenants.store import PortalUser, Tenant, TenantStore
 from ..voice import tts
 from ..voice import voices as voice_catalog
 from ..voice.tts import TtsError
+from . import ui
+from .ui import icon
 
 log = logging.getLogger("voiceorder.portal")
 
@@ -90,6 +98,16 @@ SETTING_FIELDS = [
 # custom/cloned voice ID that overrides the dropdown on save.
 VOICE_SETTING_KEYS = {"voice_id", "voice_model", "voice_id_custom"}
 
+# Zones offered in System settings. Empty = the server's local clock.
+TIMEZONES = [
+    "America/New_York", "America/Chicago", "America/Denver", "America/Phoenix",
+    "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu",
+    "Europe/London", "Asia/Kolkata", "UTC",
+]
+
+# A call still marked live after this long without a turn lost its status webhook.
+_LIVE_STALE_SECONDS = 1800
+
 
 @dataclass
 class PortalDeps:
@@ -106,185 +124,495 @@ class PortalDeps:
 
 
 # --------------------------------------------------------------------------
-# HTML
+# Data helpers
 # --------------------------------------------------------------------------
-_CSS = """
-:root{--bg:#0f1420;--card:#1a2233;--line:#2a3550;--txt:#e8edf7;--mut:#93a0bb;
---acc:#5b9dff;--ok:#3ecf8e;--warn:#ffb020;--bad:#ff6b6b}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);
-font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
-a{color:var(--acc);text-decoration:none}
-.wrap{max-width:960px;margin:0 auto;padding:24px 16px 64px}
-.topbar{background:#0b0f1a;border-bottom:1px solid var(--line);padding:12px 16px;
-display:flex;align-items:center;gap:18px;position:sticky;top:0;z-index:5}
-.topbar .brand{font-weight:700;font-size:18px}
-.topbar nav{display:flex;gap:14px;margin-left:auto}
-.topbar nav a{color:var(--mut)}.topbar nav a.on,.topbar nav a:hover{color:var(--txt)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;
-padding:20px;margin:16px 0}
-h1{font-size:24px;margin:6px 0 14px}h2{font-size:18px;margin:0 0 12px}
-.mut{color:var(--mut)}.small{font-size:13px}
-label{display:block;font-size:13px;color:var(--mut);margin:14px 0 6px}
-input,select,textarea{width:100%;padding:10px 12px;border-radius:8px;
-border:1px solid var(--line);background:#0f1626;color:var(--txt);font-size:15px}
-button,.btn{display:inline-block;padding:10px 18px;border-radius:8px;border:0;
-background:var(--acc);color:#fff;font-size:15px;cursor:pointer;margin-top:16px}
-button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
-button:disabled{opacity:.5;cursor:default}
-.tabs{display:flex;gap:8px;margin:8px 0 4px}
-.tab{padding:8px 16px;border-radius:8px;border:1px solid var(--line);
-background:transparent;color:var(--mut);cursor:pointer;margin:0}
-.tab.on{background:var(--acc);color:#fff;border-color:var(--acc)}
-.pill{display:inline-block;padding:3px 10px;border-radius:99px;font-size:12px;
-background:#24304a;color:var(--mut)}
-.pill.live{background:#123f2c;color:var(--ok)}
-.pill.bad{background:#4a1f24;color:var(--bad)}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--line)}
-th{color:var(--mut);font-weight:600;font-size:12px;text-transform:uppercase}
-.turn{border-left:3px solid var(--acc);padding:8px 12px;margin:12px 0;
-background:#141c2e;border-radius:0 8px 8px 0}
-.turn .who{font-size:12px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px}
-.turn.caller{border-color:var(--ok)}
-.alert{padding:12px 14px;border-radius:8px;margin:12px 0;font-size:14px}
-.alert.ok{background:#123f2c;color:var(--ok)}.alert.bad{background:#4a1f24;color:var(--bad)}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:0 24px}
-@media(max-width:640px){.grid2{grid-template-columns:1fr}}
-.stat{font-size:28px;font-weight:700}.statrow{display:flex;gap:16px;flex-wrap:wrap}
-.statcard{flex:1;min-width:150px}
-"""
-
-def _layout(title: str, body: str, tenant: Tenant | None, active: str,
-            platform: str) -> str:
-    nav = ""
-    if tenant:
-        links = [("Dashboard", "/portal/", "dash"), ("POS setup", "/portal/pos", "pos"),
-                 ("Live calls", "/portal/calls", "calls"),
-                 ("Support", "/portal/support", "support"),
-                 ("Marketing", "/portal/marketing", "marketing"),
-                 ("Usage", "/portal/usage", "usage"),
-                 ("Settings", "/portal/settings", "settings")]
-        nav = "<nav>" + "".join(
-            f'<a href="{u}" class="{"on" if active == k else ""}">{l}</a>'
-            for l, u, k in links) + f'<a href="/portal/logout">Log out</a></nav>'
-    tname = html.escape(tenant.name) if tenant else ""
-    return f"""<!doctype html><html><head><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>{html.escape(title)} · {html.escape(platform)}</title>
-<style>{_CSS}</style></head><body>
-<div class=topbar><div class=brand>📞 {html.escape(platform)}</div>
-{f'<span class="mut small">{tname}</span>' if tenant else ''}{nav}</div>
-<div class=wrap>{body}</div></body></html>"""
+def _e(value: Any) -> str:
+    return html.escape(str(value if value is not None else ""))
 
 
+def _tz(tenant: Tenant) -> tzinfo | None:
+    """The tenant's chosen zone, or None for the server's local clock."""
+    name = tenant.setting("timezone", "")
+    if name:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            log.warning("tenant %s: unknown time zone %r", tenant.id, name)
+    return None
+
+
+def _dt(ts: float, tz: tzinfo | None) -> datetime:
+    return datetime.fromtimestamp(ts, tz) if tz else datetime.fromtimestamp(ts)
+
+
+def _day_start(ts: float, tz: tzinfo | None) -> float:
+    return _dt(ts, tz).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+
+
+def _hm(d: datetime) -> str:
+    return d.strftime("%I:%M %p").lstrip("0")
+
+
+def _clock(ts: float | None, tz: tzinfo | None, kind: str = "time") -> str:
+    """A timestamp as HTML: server-formatted in the tenant zone, or a <time>
+    the browser fills in with the viewer's clock when no zone is set."""
+    if not ts:
+        return "—"
+    if tz is None:
+        return f'<time data-ts="{float(ts):.0f}" data-f="{kind}"></time>'
+    d = _dt(ts, tz)
+    if kind == "date":
+        return d.strftime("%b %d, %Y")
+    if kind == "datetime":
+        return f"{d.strftime('%b %d')} · {_hm(d)}"
+    return _hm(d)
+
+
+def _money(x: float) -> str:
+    return f"${x:,.2f}"
+
+
+def _dur(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+def _load_orders(deps: PortalDeps, tenant: Tenant, limit: int = 5000) -> list[dict]:
+    try:
+        return deps.order_store.list_by_tenant(tenant.id, limit)
+    except Exception:
+        log.warning("portal: order load failed for tenant %s", tenant.id, exc_info=True)
+        return []
+
+
+def _order_total(o: dict) -> float:
+    try:
+        return float((o.get("totals") or {}).get("total") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _order_items(o: dict) -> str:
+    parts = []
+    for line in o.get("lines") or []:
+        name = str(line.get("item_name") or "").strip()
+        if not name:
+            continue
+        qty = int(line.get("quantity") or 1)
+        parts.append(f"{name} (×{qty})" if qty > 1 else name)
+    return ", ".join(parts)
+
+
+def _order_no(o: dict) -> str:
+    ref = o.get("order_number") or (o.get("order_id") or "")[:8]
+    return f"#{ref}" if ref else "—"
+
+
+def _order_status(o: dict) -> tuple[str, str]:
+    """(label, pill class) for an order's POS status."""
+    s = str(o.get("status") or "submitted").lower()
+    if s in ("completed", "ready", "paid", "closed", "submitted"):
+        cls = "ok"
+    elif s in ("preparing", "in_progress", "open", "accepted"):
+        cls = "warn"
+    elif s in ("failed", "canceled", "cancelled", "rejected", "error"):
+        cls = "bad"
+    else:
+        cls = ""
+    return s.replace("_", " "), cls
+
+
+def _payment_label(o: dict) -> str:
+    return "Pay link" if (o.get("payment") or {}).get("kind") == "link" else "At pickup"
+
+
+def _delta(cur: float, prev: float) -> str:
+    if prev <= 0:
+        return ""
+    pct = (cur - prev) / prev * 100
+    return f'<span class="d {"up" if pct >= 0 else "down"}">{pct:+.1f}%</span>'
+
+
+def _is_live(call: dict, now: float) -> bool:
+    return call.get("status") == "live" and now - (call.get("updated_at") or 0) < _LIVE_STALE_SECONDS
+
+
+def _pos_state(deps: PortalDeps, tenant: Tenant) -> tuple[str, bool, str]:
+    """(provider label, connected, environment) for the tenant's POS."""
+    provider = tenant.setting("pos_profile", "")
+    if provider not in POS_PROVIDERS:
+        return (provider.replace("_", " ").title() if provider else "", False, "")
+    try:
+        creds = deps.tenants.get_secret(tenant.id, provider)
+    except Exception:
+        creds = {}
+    return POS_PROVIDERS[provider]["label"], bool(creds), str(creds.get("environment", ""))
+
+
+def _month_usage(deps: PortalDeps, tenant: Tenant, now: float, tz: tzinfo | None) -> dict:
+    month = _dt(now, tz).strftime("%Y-%m")
+    rows = [r for r in deps.tenants.get_usage(tenant.id, 31) if str(r["date"]).startswith(month)]
+    return {
+        "calls": sum(int(r["calls"] or 0) for r in rows),
+        "talk_minutes": sum(float(r["talk_minutes"] or 0) for r in rows),
+        "tts_chars": sum(int(r["tts_chars"] or 0) for r in rows),
+        "sms_sent": sum(int(r["sms_sent"] or 0) for r in rows),
+    }
+
+
+def _page(deps: PortalDeps, tenant: Tenant, active: str, title: str, body: str) -> str:
+    now = time.time()
+    live = sum(1 for c in deps.tenants.list_calls(tenant.id, 50) if _is_live(c, now))
+    label, connected, _ = _pos_state(deps, tenant)
+    return ui.shell(
+        title=title, body=body, tenant_name=tenant.name, active=active,
+        platform=deps.platform_name, live_calls=live,
+        status_label="Live workspace" if connected else "Setup needed",
+        status_ok=connected,
+    )
+
+
+def _page_head(title: str, sub: str, actions: str = "") -> str:
+    acts = f'<div class="acts">{actions}</div>' if actions else ""
+    return f'<div class="page-h"><div><h2>{_e(title)}</h2><p>{sub}</p></div>{acts}</div>'
+
+
+def _orders_table(orders: list[dict], tz: tzinfo | None, with_time: bool) -> str:
+    if not orders:
+        return '<div class="empty">No orders yet — they appear here as calls come in.</div>'
+    rows = []
+    for o in orders:
+        label, cls = _order_status(o)
+        items = _order_items(o)
+        when = f"<td class='mut'>{_clock(o.get('saved_at'), tz, 'datetime')}</td>" if with_time else ""
+        search = f"{_order_no(o)} {items}".lower()
+        rows.append(
+            f'<tr data-status="{_e(label)}" data-q="{_e(search)}">'
+            f'<td class="id">{_e(_order_no(o))}</td>'
+            f'<td>{_e(items) or "<span class=mut>—</span>"}</td>'
+            f'<td>{_money(_order_total(o))}</td>'
+            f'<td><span class="pill {cls}">{_e(label)}</span></td>{when}</tr>')
+    head = "<th>Time</th>" if with_time else ""
+    return (f'<div class="tbl-wrap"><table><thead><tr><th>Order ID</th><th>Items</th><th>Total</th>'
+            f'<th>Status</th>{head}</tr></thead><tbody>{"".join(rows)}</tbody></table></div>')
+
+
+# --------------------------------------------------------------------------
+# Pages
+# --------------------------------------------------------------------------
 def _login_page(platform: str, error: str = "", signup: bool = True) -> str:
-    body = f"""<div class=card style="max-width:420px;margin:48px auto">
-<h1>Log in</h1>
-{f'<div class="alert bad">{html.escape(error)}</div>' if error else ''}
+    body = f"""<h2>Log in</h2><p class="mut" style="margin:0 0 24px">Manage your restaurant's AI phone ordering.</p>
+{f'<div class="alert bad">{_e(error)}</div>' if error else ''}
 <form method=post action="/portal/login">
-<label>Email</label><input name=email type=email required autocomplete=email>
-<label>Password</label><input name=password type=password required autocomplete=current-password>
-<button type=submit style="width:100%">Log in</button></form>
-{"<p class='mut small'>New here? <a href='/portal/signup'>Create your restaurant account</a></p>" if signup else ""}
-</div>"""
-    return _layout("Log in", body, None, "", platform)
+<label class="f">Email</label><input name=email type=email required autocomplete=email>
+<label class="f">Password</label><input name=password type=password required autocomplete=current-password>
+<div class="actions"><button class="btn block" type=submit>Log in</button></div></form>
+{"<p class='mut small' style='margin:20px 0 0'>New here? <a href='/portal/signup'>Create your restaurant account</a></p>" if signup else ""}"""
+    return ui.auth_shell("Log in", body, platform)
 
 
 def _signup_page(platform: str, error: str = "") -> str:
-    body = f"""<div class=card style="max-width:480px;margin:48px auto">
-<h1>Create your restaurant account</h1>
-{f'<div class="alert bad">{html.escape(error)}</div>' if error else ''}
+    body = f"""<h2>Create your restaurant account</h2>
+<p class="mut" style="margin:0 0 24px">Takes a minute. You'll connect your POS next.</p>
+{f'<div class="alert bad">{_e(error)}</div>' if error else ''}
 <form method=post action="/portal/signup">
-<label>Restaurant name</label><input name=restaurant required placeholder="Hyderabad House">
-<label>Twilio phone number</label><input name=phone placeholder="+15622680097">
-<p class="mut small" style="margin:4px 0 0">The Twilio number customers call — calls to it route to you.</p>
-<label>Your email</label><input name=email type=email required autocomplete=email>
-<label>Password (8+ characters)</label><input name=password type=password required minlength=8 autocomplete=new-password>
-<button type=submit style="width:100%">Create account</button></form>
-<p class="mut small"><a href="/portal/login">Already have an account? Log in</a></p></div>"""
-    return _layout("Sign up", body, None, "", platform)
+<label class="f">Restaurant name</label><input name=restaurant required placeholder="Hyderabad House">
+<label class="f">Twilio phone number</label><input name=phone placeholder="+15622680097">
+<p class="help">The Twilio number customers call — calls to it route to you.</p>
+<label class="f">Your email</label><input name=email type=email required autocomplete=email>
+<label class="f">Password (8+ characters)</label><input name=password type=password required minlength=8 autocomplete=new-password>
+<div class="actions"><button class="btn block" type=submit>Create account</button></div></form>
+<p class="mut small" style="margin:20px 0 0"><a href="/portal/login">Already have an account? Log in</a></p>"""
+    return ui.auth_shell("Sign up", body, platform)
+
 
 def _dashboard_page(deps: PortalDeps, tenant: Tenant) -> str:
-    orders = deps.order_store.list_by_tenant(tenant.id, 8)
-    calls = deps.tenants.list_calls(tenant.id, 5)
-    live = [c for c in calls if c["status"] == "live"]
-    provider = tenant.setting("pos_profile", "")
-    connected = deps.tenants.has_secret(tenant.id, provider) if provider else False
-    rows = "".join(
-        f"<tr><td class=small>{html.escape(str(o.get('order_number', o.get('order_id', ''))))}</td>"
-        f"<td>${(o.get('totals') or {}).get('total', 0):.2f}</td>"
-        f"<td class='mut small'>{html.escape(str((o.get('payment') or {}).get('kind', '')))}</td>"
-        f"<td class='mut small'>{time.strftime('%b %d %H:%M', time.localtime(o.get('saved_at', 0)))}</td></tr>"
-        for o in orders
-    ) or "<tr><td colspan=4 class=mut>No orders yet — they'll appear here as calls come in.</td></tr>"
-    callrows = "".join(
-        f"<tr><td><span class='pill {'live' if c['status']=='live' else ''}'>{c['status']}</span></td>"
-        f"<td class=small>{html.escape(c['from_number'])}</td>"
-        f"<td class=small>{c['turn_count']} turns</td>"
-        f"<td><a href='/portal/calls/{c['call_sid']}'>View</a></td></tr>"
-        for c in calls
-    ) or "<tr><td colspan=4 class=mut>No calls yet.</td></tr>"
-    body = f"""<h1>{html.escape(tenant.name)}</h1>
-<div class="statrow">
-<div class="card statcard"><div class=stat>{len(live)}</div><div class=mut>live calls</div></div>
-<div class="card statcard"><div class=stat>{len(orders)}</div><div class=mut>recent orders</div></div>
-<div class="card statcard"><div class=stat>{html.escape(POS_PROVIDERS.get(provider, {}).get('label', '—'))}</div>
-<div class=mut>POS · {'<span style="color:var(--ok)">connected</span>' if connected else '<span style="color:var(--warn)">not configured</span>'}</div></div>
-</div>
-{"<div class='alert bad'>Your POS isn't connected yet — <a href='/portal/pos'>connect it</a> so orders flow into your system.</div>" if not connected else ""}
-<div class=card><h2>Recent orders</h2><table>
-<tr><th>Order</th><th>Total</th><th>Payment</th><th>When</th></tr>{rows}</table></div>
-<div class=card><h2>Recent calls</h2><table>
-<tr><th>Status</th><th>Caller</th><th>Length</th><th></th></tr>{callrows}</table>
-<p><a href="/portal/calls">All calls →</a></p></div>"""
-    return _layout("Dashboard", body, tenant, "dash", deps.platform_name)
+    tz, now = _tz(tenant), time.time()
+    orders = _load_orders(deps, tenant)
+    d30, d60 = now - 30 * 86400, now - 60 * 86400
+    cur = [o for o in orders if (o.get("saved_at") or 0) >= d30]
+    prev = [o for o in orders if d60 <= (o.get("saved_at") or 0) < d30]
+    rev, rev_prev = sum(map(_order_total, cur)), sum(map(_order_total, prev))
+
+    calls = deps.tenants.list_calls(tenant.id, 6)
+    live = [c for c in calls if _is_live(c, now)]
+    calls_today = deps.tenants.calls_in_window(tenant.id, _day_start(now, tz))
+    pos_label, connected, _ = _pos_state(deps, tenant)
+
+    if connected:
+        pos_card = (f'<div class="card kpi ok"><div class="l">POS connection</div>'
+                    f'<div class="status-line"><span class="dot"></span>{_e(pos_label)} active</div></div>')
+    else:
+        pos_card = (f'<div class="card kpi warn"><div class="l">POS connection</div>'
+                    f'<div class="status-line"><span class="dot warn"></span>Not connected</div>'
+                    f'<p class="small" style="margin:12px 0 0"><a href="/portal/pos">Connect your POS →</a></p></div>')
+    live_note = (f'<span class="d amber">{len(live)} live now</span>' if live else "")
+    kpis = f"""<div class="kpis">
+<div class="card kpi"><div class="l">Total revenue</div><div class="v">{_money(rev)}</div>{_delta(rev, rev_prev)}</div>
+<div class="card kpi"><div class="l">AI voice orders</div><div class="v">{len(cur)} {_delta(len(cur), len(prev))}</div></div>
+<div class="card kpi"><div class="l">Calls today</div><div class="v">{len(calls_today)} {live_note}</div></div>
+{pos_card}</div>"""
+
+    recent = f"""<div class="card"><div class="card-h"><h3>Recent AI orders</h3>
+<a class="r" href="/portal/orders">View all {icon("arrow", 16)}</a></div>
+{_orders_table(orders[:5], tz, with_time=False)}</div>"""
+
+    # Orders per day: the last 7 local days against the 7 before them.
+    today = _dt(now, tz).date()
+    days = [today - timedelta(days=i) for i in range(6, -1, -1)]
+    per_day: dict = {}
+    for o in orders:
+        if (o.get("saved_at") or 0) >= now - 15 * 86400:
+            k = _dt(o["saved_at"], tz).date()
+            per_day[k] = per_day.get(k, 0) + 1
+    this_week = [per_day.get(d, 0) for d in days]
+    last_week = [per_day.get(d - timedelta(days=7), 0) for d in days]
+    trend = f"""<div class="card"><div class="card-h"><h3>Orders trend</h3>
+<div class="legend r"><span><i style="background:var(--acc)"></i>This week</span>
+<span><i style="background:#cdd3db"></i>Last week</span></div></div>
+<div class="card-b">{ui.line_chart(this_week, last_week, [d.strftime("%a").upper() for d in days])}</div></div>"""
+
+    call_rows = []
+    for c in calls[:4]:
+        who = _e(c["from_number"] or "Unknown caller")
+        if _is_live(c, now):
+            call_rows.append(
+                f'<div class="call live"><div class="ic"><span class="dot"></span></div>'
+                f'<div class="who"><b>{who}</b><div class="meta">Live · {c["turn_count"]} turns</div>'
+                f'<div class="mut small" style="margin-top:6px">{_e(c["last_reply"][:90])}</div></div>'
+                f'<a class="go" href="/portal/calls/{_e(c["call_sid"])}">Listen in</a></div>')
+        else:
+            length = _dur((c["updated_at"] or 0) - (c["started_at"] or 0))
+            status = "ended" if c["status"] == "live" else c["status"]  # live but stale
+            call_rows.append(
+                f'<div class="call"><div class="ic">{icon("phone", 20)}</div>'
+                f'<div class="who"><b>{who}</b><div class="meta">{_e(status)} · {length}</div></div>'
+                f'<a class="go" href="/portal/calls/{_e(c["call_sid"])}">Details</a></div>')
+    calls_card = f"""<div class="card"><div class="card-h"><h3>Live call activity</h3>
+<span class="r dot{'' if live else ' gray'}" title="{'Calls in progress' if live else 'No live calls'}"></span></div>
+<div class="card-b">{"".join(call_rows) or '<p class="mut" style="margin:0">No calls yet.</p>'}
+<a class="btn ghost block" style="margin-top:20px" href="/portal/calls">View call history {icon("arrow", 16)}</a></div></div>"""
+
+    drafts = deps.tenants.list_drafts(tenant.id, 100)
+    month = _month_usage(deps, tenant, now, tz)
+    latest = _e(drafts[0]["title"]) if drafts else "No drafts yet"
+    marketing = f"""<a class="dark" href="/portal/marketing" style="display:block;text-decoration:none">
+<div class="eyebrow">Marketing · latest draft</div><h3>{latest}</h3>
+<div class="nums"><div><div class="n g">{len(drafts)}</div><div class="nl">Drafts</div></div>
+<div><div class="n o">{month["sms_sent"]}</div><div class="nl">SMS sent this month</div></div></div></a>"""
+
+    date_line = _dt(now, tz).strftime("%B %d, %Y").replace(" 0", " ")
+    body = f"""<div class="row-between"><div class="eyebrow">Overview · {date_line}</div>
+<div class="mut small">Revenue and orders: last 30 days</div></div>{kpis}
+<div class="grid-main"><div class="stack">{recent}{trend}</div>
+<div class="stack">{calls_card}{marketing}</div></div>"""
+    return _page(deps, tenant, "dash", "Dashboard", body)
 
 
-def _settings_page(deps: PortalDeps, tenant: Tenant, saved: bool = False) -> str:
+_RANGES = {7: "Last 7 days", 30: "Last 30 days", 90: "Last 90 days"}
+
+
+def _statistics_page(deps: PortalDeps, tenant: Tenant, days: int) -> str:
+    days = days if days in _RANGES else 7
+    tz, now = _tz(tenant), time.time()
+    start = _day_start(now, tz) - (days - 1) * 86400
+    prev_start = start - days * 86400
+    orders = _load_orders(deps, tenant)
+    cur = [o for o in orders if (o.get("saved_at") or 0) >= start]
+    prev = [o for o in orders if prev_start <= (o.get("saved_at") or 0) < start]
+    rev, rev_prev = sum(map(_order_total, cur)), sum(map(_order_total, prev))
+    aov = rev / len(cur) if cur else 0.0
+    aov_prev = rev_prev / len(prev) if prev else 0.0
+
+    calls = deps.tenants.calls_in_window(tenant.id, start)
+    call_sids = {c["call_sid"] for c in calls}
+    converted = sum(1 for o in cur if o.get("call_id") in call_sids)
+    conv = f"{converted / len(calls) * 100:.1f}%" if calls else "—"
+
+    kpis = f"""<div class="kpis">
+<div class="card kpi"><div class="l">Total revenue</div><div class="v">{_money(rev)}</div>{_delta(rev, rev_prev)}</div>
+<div class="card kpi"><div class="l">AI voice orders</div><div class="v">{len(cur)} {_delta(len(cur), len(prev))}</div></div>
+<div class="card kpi"><div class="l">Order conversion</div><div class="v">{conv}</div>
+<span class="d mut">{converted} of {len(calls)} calls</span></div>
+<div class="card kpi"><div class="l">Average order value</div><div class="v">{_money(aov)} {_delta(aov, aov_prev)}</div></div>
+</div>"""
+
+    # Orders per day (or per week for the 90-day view).
+    first_day = _dt(start, tz).date()
+    counts: dict = {}
+    for o in cur:
+        k = _dt(o["saved_at"], tz).date()
+        counts[k] = counts.get(k, 0) + 1
+    if days <= 30:
+        buckets = [first_day + timedelta(days=i) for i in range(days)]
+        values = [counts.get(d, 0) for d in buckets]
+        if days == 7:
+            labels = [d.strftime("%a").upper() for d in buckets]
+        else:
+            labels = [str(d.day) if i % 5 == 0 else "" for i, d in enumerate(buckets)]
+    else:
+        weeks = (days + 6) // 7
+        buckets = [first_day + timedelta(days=7 * i) for i in range(weeks)]
+        values = [sum(counts.get(b + timedelta(days=j), 0) for j in range(7)) for b in buckets]
+        labels = [f"{b.strftime('%b')} {b.day}" if i % 2 == 0 else "" for i, b in enumerate(buckets)]
+    by_day = f"""<div class="card"><div class="card-h"><h3>Orders by {"week" if days > 30 else "day"}</h3>
+<span class="r pill ok">{_e(_RANGES[days])}</span></div>
+<div class="card-b">{ui.bar_chart(values, labels) if cur else '<div class="empty">No orders in this period.</div>'}</div></div>"""
+
+    agg: dict[str, int] = {}
+    for o in cur:
+        for line in o.get("lines") or []:
+            name = str(line.get("item_name") or "").strip()
+            if name:
+                agg[name] = agg.get(name, 0) + int(line.get("quantity") or 1)
+    top = sorted(agg.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    ranks = "".join(f'<div class="rank"><span>{_e(n)}</span><span>{q} ordered</span></div>' for n, q in top)
+    items = f"""<div class="card"><div class="card-h"><h3>Most ordered items</h3>
+<span class="r eyebrow">{_e(_RANGES[days])}</span></div>
+<div class="card-b" style="padding-top:4px;padding-bottom:4px">{ranks or '<div class="empty">No items ordered yet.</div>'}</div></div>"""
+
+    ended = [c for c in calls if c["status"] != "live"]
+    avg_len = (sum((c["updated_at"] or 0) - (c["started_at"] or 0) for c in ended) / len(ended)
+               if ended else 0)
+    turn_counts, transfers = [], 0
+    for c in calls:
+        try:
+            turns = json.loads(c["turns"] or "[]")
+        except (TypeError, ValueError):
+            turns = []
+        turn_counts.append(len(turns))
+        if any(t.get("name") == "transfer_call" for turn in turns for t in turn.get("tools") or []):
+            transfers += 1
+    avg_turns = sum(turn_counts) / len(turn_counts) if turn_counts else 0
+    perf = f"""<div class="card"><div class="card-h"><h3>AI performance</h3></div><div class="card-b">
+<div class="kv"><span>Calls handled</span><b>{len(calls)}</b></div>
+<div class="kv"><span>Average call duration</span><b>{_dur(avg_len) if ended else "—"}</b></div>
+<div class="kv"><span>Average turns per call</span><b>{avg_turns:.1f}</b></div>
+<div class="kv"><span>Transferred to staff</span><b>{transfers}{f" · {transfers / len(calls) * 100:.0f}%" if calls else ""}</b></div>
+</div></div>"""
+
+    at_pickup = sum(1 for o in cur if _payment_label(o) == "At pickup")
+    by_status: dict[str, int] = {}
+    for o in cur:
+        by_status[_order_status(o)[0]] = by_status.get(_order_status(o)[0], 0) + 1
+
+    def share(n: int) -> str:
+        return f"{n / len(cur) * 100:.0f}% · {n} orders" if cur else "0 orders"
+
+    status_rows = "".join(f'<div class="kv"><span>Status: {_e(s)}</span><b>{share(n)}</b></div>'
+                          for s, n in sorted(by_status.items(), key=lambda kv: -kv[1]))
+    fulfil = f"""<div class="card"><div class="card-h"><h3>Order fulfillment</h3></div><div class="card-b">
+<div class="kv"><span>Pay at pickup</span><b>{share(at_pickup)}</b></div>
+<div class="kv"><span>Pay by link</span><b>{share(len(cur) - at_pickup)}</b></div>{status_rows}
+</div></div>"""
+
+    opts = "".join(f'<option value="{d}"{" selected" if d == days else ""}>{l}</option>'
+                   for d, l in _RANGES.items())
+    actions = (f'<select aria-label="Date range" style="width:auto" '
+               f'onchange="location.href=\'/portal/statistics?days=\'+this.value">{opts}</select>'
+               f'<a class="btn ghost" href="/portal/api/orders.csv?days={days}">{icon("download", 18)}Export</a>')
+    body = (_page_head("Statistics", "Revenue, ordering patterns, and AI performance.", actions)
+            + kpis + f'<div class="grid-2">{by_day}{items}{perf}{fulfil}</div>')
+    return _page(deps, tenant, "stats", "Statistics", body)
+
+
+_ORDERS_JS = """
+(function(){
+  var q=document.getElementById('q'), st=document.getElementById('st'), n=document.getElementById('n');
+  var rows=[].slice.call(document.querySelectorAll('#orders tbody tr'));
+  function run(){
+    var term=q.value.trim().toLowerCase(), want=st.value, shown=0;
+    rows.forEach(function(r){
+      var ok=(!term || r.dataset.q.indexOf(term)>=0) && (!want || r.dataset.status===want);
+      r.style.display=ok?'':'none'; if(ok) shown++;
+    });
+    n.textContent=shown+(shown===1?' order':' orders');
+  }
+  q.addEventListener('input', run); st.addEventListener('change', run); run();
+})();
+"""
+
+
+def _orders_page(deps: PortalDeps, tenant: Tenant) -> str:
+    tz = _tz(tenant)
+    orders = _load_orders(deps, tenant, 200)
+    statuses = sorted({_order_status(o)[0] for o in orders})
+    opts = "".join(f'<option value="{_e(s)}">{_e(s.title())}</option>' for s in statuses)
+    actions = f'<a class="btn ghost" href="/portal/api/orders.csv">{icon("download", 18)}Export orders</a>'
+    body = (_page_head("Orders", "All voice orders, from the first call to the final pickup.", actions)
+            + f"""<div style="display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-bottom:28px">
+<div style="position:relative;flex:1;min-width:220px;max-width:430px">
+<span style="position:absolute;left:16px;top:50%;transform:translateY(-50%);color:var(--mut)">{icon("search", 18)}</span>
+<input id="q" placeholder="Search orders or items…" style="padding-left:46px"></div>
+<select id="st" style="width:auto;min-width:180px"><option value="">All statuses</option>{opts}</select>
+<span class="mut" id="n"></span>{'<span class="mut small">· newest 200</span>' if len(orders) >= 200 else ''}</div>
+<div class="card" id="orders">{_orders_table(orders, tz, with_time=True)}</div>
+<script>{_ORDERS_JS}</script>""")
+    return _page(deps, tenant, "orders", "Orders", body)
+
+
+def _settings_page(deps: PortalDeps, tenant: Tenant, user: PortalUser | None = None,
+                   saved: bool = False) -> str:
     fields = ""
     for f in SETTING_FIELDS:
         val = tenant.setting(f["key"], "")
         if f["key"] == "phone_number" and not val:
             val = tenant.phone_number
-        fields += (f"<label>{f['label']}</label>"
-                   f"<input name='{f['key']}' value='{html.escape(val)}'"
-                   f" placeholder='{html.escape(f.get('placeholder', ''))}'>"
-                   + (f"<p class='mut small' style='margin:4px 0 0'>{f['help']}</p>" if f.get("help") else ""))
+        fields += (f"<label class='f'>{f['label']}</label>"
+                   f"<input name='{f['key']}' value='{_e(val)}'"
+                   f" placeholder='{_e(f.get('placeholder', ''))}'>"
+                   + (f"<p class='help'>{f['help']}</p>" if f.get("help") else ""))
+    cur_tz = tenant.setting("timezone", "")
+    tz_opts = "<option value=''>Server default</option>" + "".join(
+        f"<option{' selected' if z == cur_tz else ''}>{z}</option>" for z in TIMEZONES)
     cur_voice = tenant.setting("voice_id", "") or voice_catalog.DEFAULT_VOICE_ID
     cur_model = tenant.setting("voice_model", "") or voice_catalog.DEFAULT_MODEL_ID
     known_ids = {v[0] for v in voice_catalog.ELEVENLABS_VOICES}
     custom_voice = "" if cur_voice in known_ids else cur_voice
+    voice_name = next((n for vid, n, *_ in voice_catalog.ELEVENLABS_VOICES if vid == cur_voice),
+                      "Custom voice")
     voice_opts = "".join(
         f"<option value='{vid}'{' selected' if vid == cur_voice else ''}>"
-        f"{html.escape(name)} — {gender}, {age}, {accent}</option>"
+        f"{_e(name)} — {gender}, {age}, {accent}</option>"
         for vid, name, gender, age, accent in voice_catalog.ELEVENLABS_VOICES
     )
     model_opts = "".join(
         f"<option value='{mid}'{' selected' if mid == cur_model else ''}>"
-        f"{html.escape(label)}</option>"
+        f"{_e(label)}</option>"
         for mid, label in voice_catalog.ELEVENLABS_MODELS
     )
-    body = f"""<h1>Settings</h1>
-{f'<div class="alert ok">Saved.</div>' if saved else ''}
+    pos_label, connected, _ = _pos_state(deps, tenant)
+    phone = tenant.setting("phone_number", "") or tenant.phone_number
+    body = _page_head("System settings", "Restaurant details, time zone, and the AI voice.") + f"""
+{'<div class="alert ok">Saved.</div>' if saved else ''}
 <div id=settings-msg></div>
-<form id=settings-form>
-<div class=card><h2>Restaurant</h2>
-<div class=grid2>{fields}</div></div>
-<div class=card><h2>AI voice</h2>
-<p class='mut small'>The voice callers hear when they phone your restaurant.
-Preview a voice before saving — each preview uses a few dozen characters of your ElevenLabs free monthly budget.</p>
-<label>Voice</label>
+<div class="grid-main"><form id=settings-form>
+<h3 class="sec-h">Restaurant details</h3>{fields}
+<label class="f">Time zone</label><select name="timezone">{tz_opts}</select>
+<p class="help">Used for order times, "today", and the daily charts.</p>
+<h3 class="sec-h" style="margin-top:44px">AI voice</h3>
+<p class="mut small" style="margin:-10px 0 0">The voice callers hear when they phone your restaurant.
+Preview a voice before saving — each preview uses a few dozen characters of your ElevenLabs monthly budget.</p>
+<label class="f">Voice</label>
 <select name='voice_id'>{voice_opts}</select>
-<label>Or a custom / cloned voice ID</label>
-<input name='voice_id_custom' value='{html.escape(custom_voice)}' placeholder='Paste a voice ID — overrides the selection above'>
-<label>Model</label>
+<label class="f">Or a custom / cloned voice ID</label>
+<input name='voice_id_custom' value='{_e(custom_voice)}' placeholder='Paste a voice ID — overrides the selection above'>
+<label class="f">Model</label>
 <select name='voice_model'>{model_opts}</select>
-<div style='margin-top:10px'>
-<button type=button id=voice-preview>Preview voice</button>
-<audio id=voice-preview-audio controls style='display:none;margin-top:8px;width:100%'></audio>
-<div id=voice-preview-msg style='margin-top:8px'></div>
-</div></div>
-<button type=submit>Save settings</button></form>
+<div style='margin-top:16px'>
+<button class="btn ghost" type=button id=voice-preview>{icon("play", 16)}<span>Preview voice</span></button>
+<audio id=voice-preview-audio controls style='display:none;margin-top:12px;width:100%'></audio>
+<div id=voice-preview-msg></div></div>
+<div class="actions"><button class="btn" type=submit>{icon("save", 18)}Save changes</button></div></form>
+<div><h3 class="sec-h">Workspace</h3>
+<div class="kv"><span>Restaurant</span><b>{_e(tenant.name)}</b></div>
+<div class="kv"><span>Phone number</span><b>{_e(phone) or "—"}</b></div>
+<div class="kv"><span>Point of sale</span><b>{_e(pos_label) or "—"} <span class="pill {'ok' if connected else 'warn'}">{'Connected' if connected else 'Not connected'}</span></b></div>
+<div class="kv"><span>AI voice</span><b>{_e(voice_name)}</b></div>
+<div class="kv"><span>Voice provider</span><b>Twilio</b></div>
+{f'<div class="kv"><span>Signed in as</span><b>{_e(user.email)}</b></div>' if user else ''}
+<a class="btn ghost" style="margin-top:24px" href="/portal/logout">{icon("logout", 18)}Log out</a></div></div>
 <script>
 document.getElementById('settings-form').addEventListener('submit', async e => {{
   e.preventDefault();
@@ -294,14 +622,18 @@ document.getElementById('settings-form').addEventListener('submit', async e => {
     headers:{{'Content-Type':'application/json'}}, body: JSON.stringify(values)}});
   const j = await r.json().catch(() => ({{}}));
   if (j.ok) location.href = '/portal/settings?saved=1';
-  else document.getElementById('settings-msg').innerHTML =
-    '<div class="alert bad">' + (j.error || 'Save failed') + '</div>';
+  else {{
+    const m = document.getElementById('settings-msg');
+    m.innerHTML = '<div class="alert bad"></div>';
+    m.firstChild.textContent = j.error || 'Save failed';
+  }}
 }});
 document.getElementById('voice-preview').addEventListener('click', async () => {{
   const btn = document.getElementById('voice-preview');
+  const lbl = btn.querySelector('span');
   const msg = document.getElementById('voice-preview-msg');
   const audio = document.getElementById('voice-preview-audio');
-  btn.disabled = true; btn.textContent = 'Rendering…';
+  btn.disabled = true; lbl.textContent = 'Rendering…';
   msg.innerHTML = '';
   try {{
     const fd = new FormData(document.getElementById('settings-form'));
@@ -319,39 +651,46 @@ document.getElementById('voice-preview').addEventListener('click', async () => {
     audio.style.display = 'block';
     audio.play();
   }} catch (err) {{
-    msg.innerHTML = '<div class="alert bad">' + err.message + '</div>';
+    msg.innerHTML = '<div class="alert bad"></div>';
+    msg.firstChild.textContent = err.message;
   }}
-  btn.disabled = false; btn.textContent = 'Preview voice';
+  btn.disabled = false; lbl.textContent = 'Preview voice';
 }});
 </script>"""
-    return _layout("Settings", body, tenant, "settings", deps.platform_name)
+    return _page(deps, tenant, "settings", "System settings", body)
 
 
 def _pos_page(deps: PortalDeps, tenant: Tenant) -> str:
-    import json as _json
     tabs = "".join(
         "<button type=button class='tab' data-p='%s'>%s</button>" % (p, spec["label"])
         for p, spec in POS_PROVIDERS.items())
+    pickup = tenant.setting("pickup_minutes", "") or "20"
     # NOTE: plain string (not f-string): the JS below is full of ${...}
     # template literals that would collide with f-string braces.
-    body = """
-<h1>POS setup</h1>
-<div class=card><h2>Choose your point of sale</h2>
-<p class=mut>Orders taken by the AI caller are pushed into your POS as they happen.
-Credentials are encrypted before they're stored and are never shown back.</p>
-<div class=tabs>__TABS__</div>
+    body = _page_head("POS setup", "Manage your restaurant's point-of-sale connection.") + """
+<div class="grid-main"><div>
+<h3 class="sec-h">Choose your point of sale</h3>
+<div class="seg">__TABS__</div>
 <div id=status></div>
 <form id=pos-form><div id=fields></div>
-<button type=submit id=save>Save credentials</button>
-<button type=button class=ghost id=test>Test connection</button></form></div>
-<div class=card><h2>How it works</h2>
-<p class=mut>When a customer calls your Twilio number, the AI takes the order and
-submits it to the POS you connect here &mdash; as an <b>open, visible order</b> your staff
-can see immediately. Payment is collected at pickup unless your POS account
-supports online payment links.</p></div>
+<div class="actions"><button class="btn" type=submit id=save>__SAVE_ICON__<span>Save configuration</span></button>
+<button class="btn ghost" type=button id=test>__CHECK_ICON__<span>Test connection</span></button></div></form>
+<div class="alert" style="margin-top:36px">When a customer calls your Twilio number, the AI takes the order and
+submits it to the POS you connect here as an <b>open, visible order</b> your staff see immediately.
+Credentials are encrypted before they're stored and are never shown back.</div>
+</div>
+<div><h3 class="sec-h">Connection overview</h3>
+<div class="kv"><span>Provider</span><b id=ov-provider>—</b></div>
+<div class="kv"><span>Environment</span><b id=ov-env>—</b></div>
+<div class="kv"><span>Payment</span><b>At pickup</b></div>
+<div class="kv"><span>Pickup time</span><b>__PICKUP__ minutes</b></div>
+<div class="kv"><span>Connection</span><b id=ov-conn><span class="pill">—</span></b></div>
+</div></div>
 <script>
 const PROVIDERS = __PROVIDERS__;
 let current = null, configured = null;
+function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function alertBox(kind, text) { return '<div class="alert ' + kind + '">' + esc(text) + '</div>'; }
 async function load() {
   const r = await fetch('/portal/api/pos'); const j = await r.json();
   current = j.provider || 'square'; configured = j;
@@ -361,33 +700,37 @@ function render() {
   document.querySelectorAll('.tab').forEach(t =>
     t.classList.toggle('on', t.dataset.p === current));
   const st = document.getElementById('status');
-  if (configured && configured.provider && configured.has_secret) {
-    st.innerHTML = '<div class="alert ok">\u2713 ' + PROVIDERS[configured.provider].label +
-      ' connected.</div>';
-  } else {
-    st.innerHTML = '<div class="alert bad" style="background:#3a2f14;color:var(--warn)">' +
-      'No POS connected yet.</div>';
-  }
+  const ok = configured && configured.provider && configured.has_secret;
+  st.innerHTML = ok
+    ? alertBox('ok', '✓ ' + PROVIDERS[configured.provider].label + ' connected.')
+    : alertBox('warn', 'No POS connected yet. Choose your provider and add its credentials.');
+  document.getElementById('ov-provider').textContent = ok ? PROVIDERS[configured.provider].label : 'None';
+  const env = ok ? (configured.values.environment || 'production') : '';
+  document.getElementById('ov-env').textContent = env ? env[0].toUpperCase() + env.slice(1) : '—';
+  document.getElementById('ov-conn').innerHTML = ok
+    ? '<span class="pill ok">Connected</span>' : '<span class="pill warn">Not connected</span>';
 }
 function fieldHtml(f, v) {
-  const shown = f.secret ? (v ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' : '') : (v || '');
+  const shown = f.secret ? (v ? '••••••••' : '') : (v || '');
   let input;
   if (f.options) {
     input = '<select name="' + f.key + '">' + f.options.map(o =>
-      '<option' + (o === (v || f.default) ? ' selected' : '') + '>' + o + '</option>').join('') + '</select>';
+      '<option value="' + o + '"' + (o === (v || f.default) ? ' selected' : '') + '>' +
+      o[0].toUpperCase() + o.slice(1) + '</option>').join('') + '</select>';
   } else {
-    input = '<input name="' + f.key + '" value="' + shown.replace(/"/g, '&quot;') + '"' +
+    input = '<input name="' + f.key + '" value="' + esc(shown) + '"' +
       (f.secret ? ' type=password autocomplete=new-password' : '') +
-      ' placeholder="' + (f.placeholder || '') + '"' +
+      ' placeholder="' + esc(f.placeholder || '') + '"' +
       ((f.secret && v) ? ' data-keep=1' : '') + '>';
   }
-  let h = '<label>' + f.label + (f.optional ? ' <span class=mut>(optional)</span>' : '') + '</label>' + input;
-  if (f.help) h += '<p class="mut small" style="margin:4px 0 0">' + f.help + '</p>';
-  if (f.secret && v) h += '<p class="mut small" style="margin:4px 0 0">Saved &mdash; leave blank to keep.</p>';
+  let h = '<label class="f">' + f.label + (f.optional ? ' <span class=mut>(optional)</span>' : '') + '</label>' + input;
+  if (f.help) h += '<p class="help">' + f.help + '</p>';
+  if (f.secret && v) h += '<p class="help">Saved &mdash; leave as is to keep it.</p>';
   return h;
 }
 function select(p) {
-  current = p; render();
+  current = p;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('on', t.dataset.p === current));
   const spec = PROVIDERS[p];
   const saved = (configured && configured.provider === p) ? configured.values : {};
   document.getElementById('fields').innerHTML =
@@ -407,163 +750,259 @@ async function collect() {
   });
   return values;
 }
+function busy(btn, text) { btn.disabled = !!text; btn.querySelector('span').textContent = text || btn.dataset.l; }
+document.querySelectorAll('#save,#test').forEach(b => b.dataset.l = b.querySelector('span').textContent);
 document.getElementById('pos-form').addEventListener('submit', async e => {
   e.preventDefault();
   const btn = document.getElementById('save');
-  btn.disabled = true; btn.textContent = 'Saving\u2026';
+  busy(btn, 'Saving…');
   const r = await fetch('/portal/api/pos', {method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({provider: current, values: await collect()})});
   const j = await r.json();
-  btn.disabled = false; btn.textContent = 'Save credentials';
-  document.getElementById('status').innerHTML = j.ok
-    ? '<div class="alert ok">\u2713 Saved.</div>'
-    : '<div class="alert bad">' + (j.error || 'Save failed') + '</div>';
-  if (j.ok) load();
+  busy(btn);
+  if (j.ok) { await load(); document.getElementById('status').innerHTML = alertBox('ok', '✓ Saved.'); }
+  else document.getElementById('status').innerHTML = alertBox('bad', j.error || 'Save failed');
 });
 document.getElementById('test').addEventListener('click', async () => {
   const btn = document.getElementById('test');
-  btn.disabled = true; btn.textContent = 'Testing\u2026';
+  busy(btn, 'Testing…');
   const r = await fetch('/portal/api/pos/test', {method:'POST',
     headers:{'Content-Type':'application/json'},
     body: JSON.stringify({provider: current, values: await collect()})});
   const j = await r.json();
-  btn.disabled = false; btn.textContent = 'Test connection';
+  busy(btn);
   document.getElementById('status').innerHTML = j.ok
-    ? '<div class="alert ok">\u2713 Connection works' + (j.detail ? ' &mdash; ' + j.detail : '') + '.</div>'
-    : '<div class="alert bad">\u2717 ' + (j.error || 'Connection failed') + '</div>';
+    ? alertBox('ok', '✓ Connection works' + (j.detail ? ' — ' + j.detail : '') + '.')
+    : alertBox('bad', '✗ ' + (j.error || 'Connection failed'));
 });
 load();
 </script>
-""".replace("__TABS__", tabs).replace("__PROVIDERS__", _json.dumps(POS_PROVIDERS))
-    return _layout("POS setup", body, tenant, "pos", deps.platform_name)
+""".replace("__TABS__", tabs).replace("__PROVIDERS__", json.dumps(POS_PROVIDERS)) \
+        .replace("__PICKUP__", _e(pickup)).replace("__SAVE_ICON__", icon("save", 18)) \
+        .replace("__CHECK_ICON__", icon("check", 18))
+    return _page(deps, tenant, "pos", "POS setup", body)
 
+
+_CALLS_JS = """
+function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function dur(c) { const s = Math.max(0, Math.round(c.updated_at - c.started_at)); return s >= 60 ? Math.floor(s/60) + 'm ' + String(s%60).padStart(2,'0') + 's' : s + 's'; }
+async function load() {
+  const r = await fetch('/portal/api/calls'); if (!r.ok) return;
+  const j = await r.json();
+  const tb = document.getElementById('rows');
+  const now = Date.now() / 1000;
+  if (!j.calls.length) { tb.innerHTML = '<tr><td colspan=6 class="mut">No calls yet. They appear here the moment a customer phones in.</td></tr>'; return; }
+  tb.innerHTML = j.calls.map(c => {
+    const live = c.status === 'live' && now - c.updated_at < __STALE__;
+    return `<tr>
+    <td><span class="pill ${live ? 'ok' : ''}">${live ? 'live' : esc(c.status === 'live' ? 'ended' : c.status)}</span></td>
+    <td><b>${esc(c.from_number || 'Unknown caller')}</b></td>
+    <td class="mut">${new Date(c.started_at*1000).toLocaleString([], {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'})}</td>
+    <td class="mut">${live ? '—' : dur(c)}</td>
+    <td>${c.turn_count}</td>
+    <td><a href="/portal/calls/${encodeURIComponent(c.call_sid)}">${live ? 'Listen in' : 'Details'}</a></td></tr>`;
+  }).join('');
+}
+load(); setInterval(load, 3000);
+"""
 
 
 def _calls_page(deps: PortalDeps, tenant: Tenant) -> str:
-    body = """<h1>Calls</h1>
-<div class=card><h2>Live & recent <span class="mut small">(auto-refreshes)</span></h2>
-<table><thead><tr><th>Status</th><th>Caller</th><th>Started</th><th>Turns</th><th></th></tr></thead>
-<tbody id=rows><tr><td colspan=5 class=mut>Loading…</td></tr></tbody></table></div>
-<script>
-async function load() {
-  const r = await fetch('/portal/api/calls'); const j = await r.json();
-  const tb = document.getElementById('rows');
-  if (!j.calls.length) { tb.innerHTML = '<tr><td colspan=5 class=mut>No calls yet.</td></tr>'; return; }
-  tb.innerHTML = j.calls.map(c => `<tr>
-    <td><span class="pill ${c.status==='live'?'live':''}">${c.status}</span></td>
-    <td class=small>${c.from_number||'—'}</td>
-    <td class="mut small">${new Date(c.started_at*1000).toLocaleString()}</td>
-    <td class=small>${c.turn_count}</td>
-    <td><a href="/portal/calls/${c.call_sid}">View</a></td></tr>`).join('');
-}
-load(); setInterval(load, 3000);
-</script>"""
-    return _layout("Calls", body, tenant, "calls", deps.platform_name)
+    body = _page_head("Live calls", "Every call the AI answers, live and recent. Updates every few seconds.") + """
+<div class="card"><div class="tbl-wrap"><table><thead><tr><th>Status</th><th>Caller</th><th>Started</th>
+<th>Length</th><th>Turns</th><th></th></tr></thead>
+<tbody id=rows><tr><td colspan=6 class="mut">Loading…</td></tr></tbody></table></div></div>
+<script>""" + _CALLS_JS.replace("__STALE__", str(_LIVE_STALE_SECONDS)) + "</script>"
+    return _page(deps, tenant, "calls", "Live calls", body)
 
 
 def _call_detail_page(deps: PortalDeps, tenant: Tenant, call_sid: str) -> str:
-    body = f"""<p><a href="/portal/calls">← All calls</a></p><h1>Call</h1>
-<div class=card><div id=head class=mut>Loading…</div><div id=turns></div></div>
+    body = f"""<p style="margin:0 0 20px"><a href="/portal/calls">{icon("back", 16)} All calls</a></p>
+<div class="page-h"><div><h2>Call transcript</h2><p id=head>Loading…</p></div></div>
+<div class="card"><div class="card-b" id=turns></div></div>
 <script>
-const SID = {__import__('json').dumps(call_sid)};
+const SID = {json.dumps(call_sid)};
+function esc(s) {{ const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }}
 async function load() {{
-  const r = await fetch('/portal/api/calls/' + SID);
+  const r = await fetch('/portal/api/calls/' + encodeURIComponent(SID));
   if (r.status === 404) {{ document.getElementById('head').textContent = 'Call not found.'; return; }}
   const j = await r.json();
   document.getElementById('head').innerHTML =
-    `<span class="pill ${{j.status==='live'?'live':''}}">${{j.status}}</span>
-     <span class=small> from ${{j.from_number||'—'}} · started
-     ${{new Date(j.started_at*1000).toLocaleString()}}</span>`;
+    `<span class="pill ${{j.status==='live'?'ok':''}}">${{esc(j.status)}}</span>
+     &nbsp;From ${{esc(j.from_number||'unknown caller')}} · started
+     ${{new Date(j.started_at*1000).toLocaleString()}}`;
   const el = document.getElementById('turns');
   el.innerHTML = j.turns.length ? j.turns.map(t => `
-    <div class="turn caller"><div class=who>Caller · ${{new Date(t.ts*1000).toLocaleTimeString()}}</div>
-      ${{t.heard||'<i class=mut>(no speech captured)</i>'}}</div>
-    <div class=turn><div class=who>Assistant${{t.tools&&t.tools.length?' · '+t.tools.map(x=>x.name).join(', '):''}}</div>
-      ${{t.reply}}</div>`).join('')
-    : '<p class=mut>No conversation yet.</p>';
-  el.scrollTop = el.scrollHeight;
+    <div class="bubble caller"><div class=w>Caller · ${{new Date(t.ts*1000).toLocaleTimeString()}}</div>
+      ${{t.heard ? esc(t.heard) : '<i class=mut>(no speech captured)</i>'}}</div>
+    <div class="bubble ai"><div class=w>AI${{t.tools&&t.tools.length?' · '+esc(t.tools.map(x=>x.name).join(', ')):''}}</div>
+      ${{esc(t.reply)}}</div>`).join('')
+    : '<p class=mut style="margin:0">No conversation yet.</p>';
 }}
 load(); setInterval(load, 2000);
 </script>"""
-    return _layout("Call", body, tenant, "calls", deps.platform_name)
+    return _page(deps, tenant, "calls", "Call", body)
 
 
-_SEV_PILL = {"critical": "bad", "warning": "", "info": "live"}
-_CHANNEL_PILL = {"sms": "live", "social": "", "in-store": ""}
+_SEV_PILL = {"critical": "bad", "warning": "warn", "info": "ok"}
+_CHANNEL_PILL = {"sms": "ok", "social": "", "in-store": "warn"}
+
+_FAQ = [
+    ("Where can I review an AI conversation?",
+     "Open <a href='/portal/calls'>Live calls</a> and choose Details on any call. You'll see the "
+     "full transcript, which updates live while the call is in progress."),
+    ("Which point-of-sale providers are available?",
+     "Square, Toast, and Clover. Connect yours under <a href='/portal/pos'>POS setup</a>; orders "
+     "arrive there as open orders your staff can see right away."),
+    ("When is customer payment collected?",
+     "At pickup by default. If your POS account supports payment links, the caller's text receipt "
+     "includes a link to pay ahead."),
+    ("Does this workspace send real SMS messages?",
+     "Only order receipts to the caller, and only when Twilio messaging is configured. Marketing "
+     "drafts are never sent automatically."),
+    ("How do I change the voice callers hear?",
+     "Go to <a href='/portal/settings'>System settings</a> → AI voice, preview a voice, and save."),
+]
 
 
-def _support_page(deps: PortalDeps, tenant: Tenant) -> str:
+def _support_page(deps: PortalDeps, tenant: Tenant, sent: bool = False) -> str:
+    tz = _tz(tenant)
     tickets = deps.tenants.list_tickets(tenant.id)
     if not tickets:
-        rows = '<tr><td colspan=4 class=mut>No tickets — everything looks healthy.</td></tr>'
+        rows = '<tr><td colspan=3 class="mut">No alerts — everything looks healthy.</td></tr>'
     else:
         parts = []
         for t in tickets:
             sev = _SEV_PILL.get(t["severity"], "")
             plat = ' <span class="pill">Platform</span>' if not t["tenant_id"] else ""
             status = t["status"]
-            sp = "bad" if status == "open" else ("live" if status == "resolved" else "")
-            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(t["created_at"]))
+            sp = "bad" if status == "open" else ("ok" if status == "resolved" else "")
             action = ""
             if status == "open" and t["tenant_id"]:
-                action = (f'<form method=post action="/portal/api/tickets/{t["id"]}/ack"'
-                          f' style="margin:0"><button class=ghost type=submit'
-                          f' style="margin:0;padding:6px 12px;font-size:13px">'
+                action = (f'<form method=post action="/portal/api/tickets/{_e(t["id"])}/ack"'
+                          f' style="margin:8px 0 0"><button class="btn ghost sm" type=submit>'
                           f'Acknowledge</button></form>')
             parts.append(
-                f"<tr><td><span class='pill {sev}'>{html.escape(t['severity'])}</span>{plat}</td>"
-                f"<td><b>{html.escape(t['title'])}</b>"
-                f"<div class='mut small'>{html.escape(t['detail'])[:200]}</div></td>"
-                f"<td><span class='pill {sp}'>{html.escape(status)}</span>"
-                f"<div class='mut small'>{when}</div></td>"
-                f"<td>{action}</td></tr>")
+                f"<tr><td><span class='pill {sev}'>{_e(t['severity'])}</span>{plat}</td>"
+                f"<td><b>{_e(t['title'])}</b>"
+                f"<div class='mut small' style='margin-top:4px'>{_e(t['detail'][:200])}</div></td>"
+                f"<td><span class='pill {sp}'>{_e(status)}</span>"
+                f"<div class='mut small' style='margin-top:6px'>{_clock(t['created_at'], tz, 'datetime')}</div>"
+                f"{action}</td></tr>")
         rows = "".join(parts)
-    body = f"""<h1>Support</h1>
-<div class=card><h2>Tickets <span class="mut small">open first, then recently resolved</span></h2>
-<table><thead><tr><th>Severity</th><th>Issue</th><th>Status</th><th></th></tr></thead>
-<tbody>{rows}</tbody></table></div>"""
-    return _layout("Support", body, tenant, "support", deps.platform_name)
+    faqs = "".join(f'<details class="faq"><summary>{q}</summary><p>{a}</p></details>' for q, a in _FAQ)
+    body = _page_head("Support", "Help for your restaurant and voice-ordering workspace.") + f"""
+<div class="grid-main"><div class="stack">
+<div class="card"><div class="card-h"><h3>Alerts &amp; requests</h3><span class="r mut small">Open first</span></div>
+<div class="tbl-wrap"><table><thead><tr><th>Severity</th><th>Issue</th><th>Status</th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>
+<div><h3 class="sec-h">Frequently asked questions</h3>{faqs}</div></div>
+<div><h3 class="sec-h">Contact support</h3>
+{'<div class="alert ok">Request received. It is logged under Alerts &amp; requests.</div>' if sent else ''}
+<form method=post action="/portal/support/request">
+<label class="f">Subject</label><input name=subject required maxlength=120 placeholder="How can we help?">
+<label class="f">Message</label><textarea name=message required maxlength=2000 placeholder="Describe the issue…"></textarea>
+<div class="actions"><button class="btn" type=submit>{icon("send", 18)}Send request</button></div></form></div>
+</div>"""
+    return _page(deps, tenant, "support", "Support", body)
 
 
 def _marketing_page(deps: PortalDeps, tenant: Tenant) -> str:
+    tz, now = _tz(tenant), time.time()
     drafts = deps.tenants.list_drafts(tenant.id)
     if not drafts:
-        cards = ('<div class=card><p class=mut>No drafts yet. The marketing agent '
-                 'generates fresh promo ideas from your menu and best sellers every week.</p></div>')
+        cards = ('<div class="card"><div class="empty">No drafts yet. The marketing agent writes '
+                 'fresh promo ideas from your menu and best sellers every week.</div></div>')
     else:
-        parts = []
-        for d in drafts:
-            pill = _CHANNEL_PILL.get(d["channel"], "")
-            when = time.strftime("%Y-%m-%d", time.localtime(d["created_at"]))
-            parts.append(
-                f"""<div class=card><h2>{html.escape(d['title'])}
-<span class="pill {pill}">{html.escape(d['channel'])}</span>
-<span class="mut small"> · {when} · {html.escape(d['status'])}</span></h2>
-<p style="white-space:pre-wrap">{html.escape(d['body'])}</p></div>""")
-        cards = "".join(parts)
-    body = (f"<h1>Marketing</h1>"
-            f"<p class=mut>Promo drafts from your real menu and best sellers. "
-            f"Drafts only — nothing is ever sent automatically.</p>{cards}")
-    return _layout("Marketing", body, tenant, "marketing", deps.platform_name)
+        cards = "".join(
+            f"""<div class="card"><div class="card-h"><h3>{_e(d['title'])}</h3>
+<span class="r pill {_CHANNEL_PILL.get(d['channel'], '')}">{_e(d['channel'])}</span></div>
+<div class="card-b"><p style="white-space:pre-wrap;margin:0;line-height:1.6">{_e(d['body'])}</p>
+<p class="mut small" style="margin:16px 0 0">{_clock(d['created_at'], tz, 'date')} · {_e(d['status'])}</p></div></div>"""
+            for d in drafts)
+    month_start = _dt(now, tz).replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    this_month = sum(1 for d in drafts if (d["created_at"] or 0) >= month_start)
+    usage = _month_usage(deps, tenant, now, tz)
+    side = f"""<div class="dark"><div class="eyebrow">Marketing performance</div>
+<h3>{"Drafts ready to use" if drafts else "Drafts on the way"}</h3>
+<div class="nums"><div><div class="n g">{this_month}</div><div class="nl">Drafts this month</div></div>
+<div><div class="n o">{usage["sms_sent"]}</div><div class="nl">SMS sent this month</div></div></div>
+<p style="color:#9aa1ab;margin:36px 0 0;line-height:1.6;font-size:14px">Drafts only. Nothing is ever sent
+automatically; copy a draft into your SMS tool, social post, or in-store sign.</p></div>"""
+    body = (_page_head("Marketing", "Promo drafts written from your real menu and best sellers.")
+            + f'<div class="grid-main"><div class="stack" style="gap:24px">{cards}</div><div>{side}</div></div>')
+    return _page(deps, tenant, "marketing", "Marketing", body)
+
+
+# ElevenLabs free plan allowance; shown as the reference for voice characters.
+_TTS_FREE_CHARS = 10_000
 
 
 def _usage_page(deps: PortalDeps, tenant: Tenant) -> str:
+    tz, now = _tz(tenant), time.time()
+    local = _dt(now, tz)
+    month = _month_usage(deps, tenant, now, tz)
+    next_month = (local.replace(day=28) + timedelta(days=4)).replace(day=1)
     rows_data = deps.tenants.get_usage(tenant.id)
     if not rows_data:
-        rows = '<tr><td colspan=5 class=mut>No usage recorded yet.</td></tr>'
+        rows = '<tr><td colspan=5 class="mut">No usage recorded yet.</td></tr>'
     else:
         rows = "".join(
-            f"<tr><td>{html.escape(r['date'])}</td><td>{r['calls']}</td>"
-            f"<td>{r['talk_minutes']:.1f}</td><td>{r['tts_chars']}</td>"
+            f"<tr><td class='id'>{_e(r['date'])}</td><td>{r['calls']}</td>"
+            f"<td>{r['talk_minutes']:.1f}</td><td>{r['tts_chars']:,}</td>"
             f"<td>{r['sms_sent']}</td></tr>"
             for r in rows_data)
-    body = f"""<h1>Usage</h1>
-<div class=card><h2>Daily usage <span class="mut small">newest first</span></h2>
-<table><thead><tr><th>Date</th><th>Calls</th><th>Talk min</th><th>TTS chars</th><th>SMS sent</th></tr></thead>
-<tbody>{rows}</tbody></table>
-<p class="mut small">Talk minutes are wall-clock call durations; TTS chars count spoken reply text.</p></div>"""
-    return _layout("Usage", body, tenant, "usage", deps.platform_name)
+    pct = min(month["tts_chars"] / _TTS_FREE_CHARS * 100, 100)
+    body = _page_head("Usage", f"Calls, voice minutes, and messages for {local.strftime('%B %Y')}.",
+                      f'<span class="pill ok">{_e(local.strftime("%b %Y"))}</span>') + f"""
+<div class="grid-2" style="gap:24px">
+<div class="card card-b"><h3 class="sec-h" style="margin-bottom:24px">Voice minutes</h3>
+<div class="kpi" style="padding:0;min-height:0"><div class="v" style="margin:0">{month["talk_minutes"]:,.1f}
+<span class="mut" style="font-size:18px;font-weight:400">minutes this month</span></div></div></div>
+<div class="card card-b"><h3 class="sec-h" style="margin-bottom:24px">AI calls</h3>
+<div class="kpi" style="padding:0;min-height:0"><div class="v" style="margin:0">{month["calls"]:,}
+<span class="mut" style="font-size:18px;font-weight:400">calls this month</span></div></div></div>
+</div>
+<h3 class="sec-h" style="margin-top:48px">This billing period</h3>
+<div class="kv"><span>Billing cycle</span><b>{local.strftime("%B")} 1 – {(next_month - timedelta(days=1)).day}, {local.year}</b></div>
+<div class="kv"><span>Restaurant locations</span><b>1</b></div>
+<div class="kv"><span>SMS messages sent</span><b>{month["sms_sent"]:,}</b></div>
+<div class="kv" style="display:block"><div class="row-between"><span>Voice characters (ElevenLabs)</span>
+<b>{month["tts_chars"]:,} / {_TTS_FREE_CHARS:,}</b></div>
+<div class="bar" style="height:6px;margin-top:14px;background:var(--gray-soft)"><i style="width:{pct:.1f}%"></i></div>
+<p class="help">Measured against the ElevenLabs free-plan monthly allowance.</p></div>
+<div class="kv"><span>Next reset</span><b>{next_month.strftime("%B")} 1, {next_month.year}</b></div>
+<div class="card" style="margin-top:48px"><div class="card-h"><h3>Daily usage</h3><span class="r mut small">Newest first</span></div>
+<div class="tbl-wrap"><table><thead><tr><th>Date</th><th>Calls</th><th>Talk min</th><th>Voice chars</th><th>SMS sent</th></tr></thead>
+<tbody>{rows}</tbody></table></div></div>
+<p class="mut small">Talk minutes are wall-clock call durations; voice characters count spoken reply text.</p>"""
+    return _page(deps, tenant, "usage", "Usage", body)
+
+
+def _csv_cell(value: Any) -> str:
+    """Neutralize spreadsheet formulas in caller-supplied text."""
+    s = str(value if value is not None else "")
+    return "'" + s if s[:1] in ("=", "+", "-", "@") else s
+
+
+def _orders_csv(deps: PortalDeps, tenant: Tenant, days: int) -> str:
+    tz, now = _tz(tenant), time.time()
+    orders = _load_orders(deps, tenant)
+    if days > 0:
+        start = _day_start(now, tz) - (days - 1) * 86400
+        orders = [o for o in orders if (o.get("saved_at") or 0) >= start]
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["order", "placed_at", "items", "total", "status", "payment",
+                "customer_name", "customer_phone", "pickup_time"])
+    for o in orders:
+        placed = _dt(o["saved_at"], tz).strftime("%Y-%m-%d %H:%M") if o.get("saved_at") else ""
+        w.writerow([_csv_cell(v) for v in (
+            _order_no(o), placed, _order_items(o), f"{_order_total(o):.2f}",
+            _order_status(o)[0], _payment_label(o), o.get("customer_name"),
+            o.get("customer_phone"), o.get("pickup_time"))])
+    return buf.getvalue()
 
 
 # --------------------------------------------------------------------------
@@ -690,13 +1129,29 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
         _, tenant = res
         return _dashboard_page(deps, tenant)
 
+    @router.get("/portal/statistics", response_class=HTMLResponse)
+    async def statistics_page(request: Request, days: int = 7):
+        res = page_user(request)
+        if isinstance(res, RedirectResponse):
+            return res
+        _, tenant = res
+        return _statistics_page(deps, tenant, days)
+
+    @router.get("/portal/orders", response_class=HTMLResponse)
+    async def orders_page(request: Request):
+        res = page_user(request)
+        if isinstance(res, RedirectResponse):
+            return res
+        _, tenant = res
+        return _orders_page(deps, tenant)
+
     @router.get("/portal/settings", response_class=HTMLResponse)
     async def settings_page(request: Request, saved: int = 0):
         res = page_user(request)
         if isinstance(res, RedirectResponse):
             return res
-        _, tenant = res
-        return _settings_page(deps, tenant, saved=bool(saved))
+        user, tenant = res
+        return _settings_page(deps, tenant, user, saved=bool(saved))
 
     @router.get("/portal/pos", response_class=HTMLResponse)
     async def pos_page(request: Request):
@@ -725,12 +1180,29 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
         return _call_detail_page(deps, tenant, call_sid)
 
     @router.get("/portal/support", response_class=HTMLResponse)
-    async def support_page(request: Request):
+    async def support_page(request: Request, sent: int = 0):
         res = page_user(request)
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
-        return _support_page(deps, tenant)
+        return _support_page(deps, tenant, sent=bool(sent))
+
+    @router.post("/portal/support/request")
+    async def support_request(request: Request):
+        res = page_user(request)
+        if isinstance(res, RedirectResponse):
+            return res
+        user, tenant = res
+        form = await request.form()
+        subject = str(form.get("subject", "")).strip()[:120]
+        message = str(form.get("message", "")).strip()[:2000]
+        if not subject or not message:
+            return RedirectResponse("/portal/support", status_code=302)
+        # Unique kind: open_ticket dedupes per kind, but every request stands alone.
+        deps.tenants.open_ticket(tenant.id, f"support_request:{uuid.uuid4().hex[:8]}", "info",
+                                 f"Support request: {subject}", f"From {user.email}: {message}")
+        log.info("portal: tenant %s opened a support request", tenant.id)
+        return RedirectResponse("/portal/support?sent=1", status_code=302)
 
     @router.get("/portal/marketing", response_class=HTMLResponse)
     async def marketing_page(request: Request):
@@ -779,6 +1251,16 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
              "saved_at": o.get("saved_at")}
             for o in orders
         ]}
+
+    @router.get("/portal/api/orders.csv")
+    async def api_orders_csv(request: Request, days: int = 0):
+        _, tenant = api_user(request)
+        stamp = time.strftime("%Y%m%d")
+        return Response(
+            content=_orders_csv(deps, tenant, max(0, min(days, 3650))),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="orders-{stamp}.csv"'},
+        )
 
     @router.get("/portal/api/tickets")
     async def api_tickets(request: Request):
@@ -871,7 +1353,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
     async def api_settings_save(request: Request):
         _, tenant = api_user(request)
         body = await request.json()
-        allowed = {f["key"] for f in SETTING_FIELDS} | VOICE_SETTING_KEYS
+        allowed = {f["key"] for f in SETTING_FIELDS} | VOICE_SETTING_KEYS | {"timezone"}
         values = {k: str(v).strip() for k, v in body.items() if k in allowed}
         # A pasted custom/cloned voice ID wins over the dropdown selection.
         custom_voice = values.pop("voice_id_custom", "")
@@ -882,6 +1364,8 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
                                 status_code=400)
         if "voice_model" in values and not voice_catalog.is_known_model(values["voice_model"]):
             return JSONResponse({"ok": False, "error": "unknown voice model"}, status_code=400)
+        if values.get("timezone") and values["timezone"] not in TIMEZONES:
+            return JSONResponse({"ok": False, "error": "unknown time zone"}, status_code=400)
         if "pickup_minutes" in values:
             try:
                 values["pickup_minutes"] = str(max(5, int(values["pickup_minutes"])))
