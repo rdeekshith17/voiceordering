@@ -1,16 +1,16 @@
 """Multi-tenant storage: tenants, per-tenant settings + encrypted POS
-secrets, portal users, and per-call transcripts. SQLite, same patterns as
-voiceorder.api.storage."""
+secrets, portal users, and per-call transcripts. SQLite or Postgres (see
+voiceorder.db), same patterns as voiceorder.api.storage."""
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import db as dbmod
 from . import crypto
 
 
@@ -44,15 +44,13 @@ class PortalUser:
 
 class TenantStore:
     def __init__(self, db_path: str | Path) -> None:
-        self._db = Path(db_path)
+        """db_path: a SQLite file path or a postgres:// URL."""
         self._lock = threading.Lock()
-        self._conn = self._connect()
+        self._conn = self._connect(db_path)
 
     # -- schema ------------------------------------------------------------
-    def _connect(self) -> sqlite3.Connection:
-        self._db.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(self._db), check_same_thread=False)
-        conn.execute("PRAGMA journal_mode=WAL")
+    def _connect(self, target: str | Path) -> dbmod.Database:
+        conn = dbmod.Database(target)
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS tenants (
@@ -135,14 +133,14 @@ class TenantStore:
         # orders.tenant_id migration (orders table lives in the same DB file
         # when the app uses the default path; harmless if the table is absent)
         try:
-            cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
+            cols = conn.columns("orders")
             if cols and "tenant_id" not in cols:
                 conn.execute("ALTER TABLE orders ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''")
                 conn.execute(
                     "CREATE INDEX IF NOT EXISTS idx_orders_tenant "
                     "ON orders (tenant_id, saved_at DESC)"
                 )
-        except sqlite3.Error:
+        except dbmod.Error:
             pass
         conn.commit()
         return conn
@@ -212,22 +210,19 @@ class TenantStore:
     def set_settings(self, tenant_id: str, values: dict) -> None:
         with self._lock:
             for k, v in values.items():
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO tenant_settings (tenant_id, key, value)"
-                    " VALUES (?, ?, ?)",
-                    (tenant_id, k, str(v)),
-                )
+                self._conn.upsert("tenant_settings",
+                                  {"tenant_id": tenant_id, "key": k, "value": str(v)},
+                                  key=("tenant_id", "key"))
             self._conn.commit()
 
     # -- secrets (encrypted at rest) ---------------------------------------
     def set_secret(self, tenant_id: str, provider: str, values: dict) -> None:
         blob = crypto.encrypt_secret(json.dumps(values))
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO tenant_secrets (tenant_id, provider, blob, updated_at)"
-                " VALUES (?, ?, ?, ?)",
-                (tenant_id, provider, blob, time.time()),
-            )
+            self._conn.upsert("tenant_secrets",
+                              {"tenant_id": tenant_id, "provider": provider, "blob": blob,
+                               "updated_at": time.time()},
+                              key=("tenant_id", "provider"))
             self._conn.commit()
 
     def get_secret(self, tenant_id: str, provider: str) -> dict:
@@ -314,13 +309,12 @@ class TenantStore:
     def start_call(self, call_sid: str, tenant_id: str, from_number: str, to_number: str) -> None:
         now = time.time()
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO call_transcripts"
-                " (call_sid, tenant_id, from_number, to_number, status, turns,"
-                "  started_at, updated_at)"
-                " VALUES (?, ?, ?, ?, 'live', '[]', ?, ?)",
-                (call_sid, tenant_id, from_number, to_number, now, now),
-            )
+            self._conn.upsert("call_transcripts",
+                              {"call_sid": call_sid, "tenant_id": tenant_id,
+                               "from_number": from_number, "to_number": to_number,
+                               "status": "live", "turns": "[]",
+                               "started_at": now, "updated_at": now},
+                              key=("call_sid",))
             self._conn.commit()
 
     def append_turn(
@@ -435,7 +429,7 @@ class TenantStore:
                     "SELECT COUNT(*) FROM orders WHERE tenant_id = ?",
                     (tenant_id,),
                 ).fetchone()
-        except sqlite3.Error:
+        except dbmod.Error:
             return 0
         return row[0] if row else 0
 
@@ -443,8 +437,9 @@ class TenantStore:
     @staticmethod
     def _tenant_match(tenant_id: str | None) -> tuple[str, tuple]:
         """SQL fragment matching a tenant_id that may be NULL (platform-wide)."""
-        return ("(tenant_id = ? OR (tenant_id IS NULL AND ? IS NULL))",
-                (tenant_id, tenant_id))
+        if tenant_id is None:
+            return "tenant_id IS NULL", ()
+        return "tenant_id = ?", (tenant_id,)
 
     def open_ticket(self, tenant_id: str | None, kind: str, severity: str,
                     title: str, detail: str = "", now: float | None = None) -> dict | None:
@@ -580,12 +575,11 @@ class TenantStore:
                      now: float | None = None) -> None:
         now = now if now is not None else time.time()
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO usage_daily"
-                " (tenant_id, date, calls, talk_minutes, tts_chars, sms_sent,"
-                "  computed_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (tenant_id, date, calls, talk_minutes, tts_chars, sms_sent, now),
-            )
+            self._conn.upsert("usage_daily",
+                              {"tenant_id": tenant_id, "date": date, "calls": calls,
+                               "talk_minutes": talk_minutes, "tts_chars": tts_chars,
+                               "sms_sent": sms_sent, "computed_at": now},
+                              key=("tenant_id", "date"))
             self._conn.commit()
 
     def get_usage(self, tenant_id: str, limit: int = 30) -> list[dict]:
@@ -619,7 +613,7 @@ class TenantStore:
                     "SELECT payload FROM orders WHERE tenant_id = ? AND saved_at >= ?",
                     (tenant_id, now - days * 86400),
                 ).fetchall()
-        except sqlite3.Error:
+        except dbmod.Error:
             return []
         agg: dict[str, dict] = {}
         for (payload,) in rows:

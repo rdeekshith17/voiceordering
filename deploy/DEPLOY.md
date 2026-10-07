@@ -6,11 +6,36 @@ prepped here; you (or whoever owns the accounts) supply the host, domain, and se
 ## What you're deploying
 
 - **App:** FastAPI, `uvicorn voiceorder.api.main:app`, listens on `$PORT` (default 8000).
-- **State:** SQLite at `data/voiceorder.db` (override with `VOICEORDER_DB`),
-  backups in `data/backups/`, menu cache `data/square_catalog.json`,
-  TTS cache in `.tts_cache/`. All of this must live on a **persistent volume**.
-- **Stateless parts:** nothing else. Any number of identical containers can run,
-  but keep it to **one replica** — SQLite can't be shared across replicas.
+- **State:** orders, carts, tenants, portal accounts, POS credentials, settings,
+  call transcripts, tickets and usage. Either:
+  - **Postgres** — set `DATABASE_URL=postgresql://…` and everything lives there.
+    Use this on any host whose disk is wiped on deploy (Render free plan).
+  - **SQLite** (default) — `data/voiceorder.db` (override with `VOICEORDER_DB`),
+    which must live on a **persistent volume**.
+  Menu cache `data/square_catalog.json` and TTS cache `.tts_cache/` are caches
+  and can be lost safely.
+- **Stateless parts:** nothing else. Keep it to **one replica** on SQLite —
+  SQLite can't be shared across replicas.
+
+## Option 0 — Render free plan + free Postgres (no monthly cost)
+
+Render's free plan wipes the container's disk on every deploy, restart and
+idle spin-down, so data must live in an outside database.
+
+1. Create a free Postgres at **neon.tech** (or supabase.com). Pick the region
+   closest to your Render region. Copy the connection string; it looks like
+   `postgresql://user:password@ep-xxxx.us-east-2.aws.neon.tech/neondb?sslmode=require`.
+2. Render dashboard → your service → **Environment** → add
+   `DATABASE_URL` = that connection string → **Save** (this redeploys).
+3. Check the deploy log for `storage backend: postgres (postgres://…@<host>)`.
+   If you see `DATABASE_URL is not set` instead, the variable didn't save.
+4. Sign up again in the portal once (earlier data was already wiped), connect
+   your POS, and set your time zone. From now on it survives deploys.
+5. Keep `TENANT_MASTER_KEY` unchanged forever: saved POS credentials are
+   encrypted with it and can't be read with a different key.
+
+The free plan still sleeps after 15 minutes idle, so the first call after a
+quiet spell can time out while the service wakes up (see Option A).
 
 ## Option A — Render (easiest, ~$7/mo)
 

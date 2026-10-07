@@ -1,22 +1,21 @@
 """Storage ports: live carts and persisted orders.
 
 SQLite is the default backend: one file under the data directory, so carts
-and orders survive process restarts with no extra services to run. Set
+and orders survive process restarts with no extra services to run. Pass a
+postgres:// URL instead of a path (DATABASE_URL in the API) to keep them in
+Postgres, which survives redeploys on hosts with throwaway disks. Set
 STORAGE_BACKEND=memory to use the volatile in-memory stores (tests, demos).
-Redis (live carts) and Postgres (orders) remain the scale-up path; both
-implement the same CartStore / OrderStore protocols, so the tools and the API
-do not change.
 """
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Protocol
 
+from .. import db as dbmod
 from ..core.cart import Cart
 
 
@@ -87,27 +86,20 @@ class InMemoryOrderStore:
         return matches[:limit]
 
 
-def _connect(db_path: Path) -> sqlite3.Connection:
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute(
+def _connect(target: str | Path) -> dbmod.Database:
+    conn = dbmod.Database(target)
+    conn.executescript(
         "CREATE TABLE IF NOT EXISTS carts ("
-        " cart_id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL)"
-    )
-    conn.execute(
+        " cart_id TEXT PRIMARY KEY, payload TEXT NOT NULL, updated_at REAL NOT NULL);"
         "CREATE TABLE IF NOT EXISTS orders ("
         " order_id TEXT PRIMARY KEY, restaurant_id TEXT NOT NULL,"
         " payload TEXT NOT NULL, saved_at REAL NOT NULL,"
-        " tenant_id TEXT NOT NULL DEFAULT '')"
-    )
-    conn.execute(
+        " tenant_id TEXT NOT NULL DEFAULT '');"
         "CREATE INDEX IF NOT EXISTS idx_orders_restaurant "
-        "ON orders (restaurant_id, saved_at DESC)"
+        "ON orders (restaurant_id, saved_at DESC);"
     )
     # Migration for databases created before multi-tenancy.
-    _cols = [r[1] for r in conn.execute("PRAGMA table_info(orders)").fetchall()]
-    if "tenant_id" not in _cols:
+    if "tenant_id" not in conn.columns("orders"):
         conn.execute(
             "ALTER TABLE orders ADD COLUMN tenant_id TEXT NOT NULL DEFAULT ''"
         )
@@ -120,13 +112,12 @@ def _connect(db_path: Path) -> sqlite3.Connection:
 
 
 class SqliteCartStore:
-    """Live carts in SQLite. Same interface as InMemoryCartStore, but the
-    data survives restarts. One connection guarded by a lock; FastAPI runs
-    the endpoints in threads, sqlite handles it with check_same_thread=False
-    plus serialized access."""
+    """Live carts in SQLite or Postgres. Same interface as InMemoryCartStore,
+    but the data survives restarts. One connection guarded by a lock; FastAPI
+    runs the endpoints in threads."""
 
     def __init__(self, db_path: str | Path) -> None:
-        self._conn = _connect(Path(db_path))
+        self._conn = _connect(db_path)
         self._lock = threading.Lock()
 
     def create(self, restaurant_id: str) -> Cart:
@@ -147,11 +138,10 @@ class SqliteCartStore:
 
     def save(self, cart: Cart) -> None:
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO carts (cart_id, payload, updated_at)"
-                " VALUES (?, ?, ?)",
-                (cart.cart_id, json.dumps(cart.to_dict()), time.time()),
-            )
+            self._conn.upsert("carts",
+                              {"cart_id": cart.cart_id, "payload": json.dumps(cart.to_dict()),
+                               "updated_at": time.time()},
+                              key=("cart_id",))
             self._conn.commit()
 
     def delete(self, cart_id: str) -> None:
@@ -161,30 +151,27 @@ class SqliteCartStore:
 
 
 class SqliteOrderStore:
-    """Persisted orders in SQLite. list_recent is served by an index on
-    (restaurant_id, saved_at)."""
+    """Persisted orders in SQLite or Postgres. list_recent is served by an
+    index on (restaurant_id, saved_at)."""
 
     def __init__(self, db_path: str | Path) -> None:
-        self._conn = _connect(Path(db_path))
+        self._conn = _connect(db_path)
         self._lock = threading.Lock()
 
     def save(self, order: dict) -> dict:
         record = dict(order)
-        record.setdefault("order_id", uuid.uuid4().hex[:12])
+        # The POS may hand back no order_id (None); it is the primary key.
+        if not record.get("order_id"):
+            record["order_id"] = uuid.uuid4().hex[:12]
         record["saved_at"] = time.time()
         with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO orders"
-                " (order_id, restaurant_id, payload, saved_at, tenant_id)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (
-                    record["order_id"],
-                    record.get("restaurant_id", ""),
-                    json.dumps(record),
-                    record["saved_at"],
-                    record.get("tenant_id", ""),
-                ),
-            )
+            self._conn.upsert("orders",
+                              {"order_id": record["order_id"],
+                               "restaurant_id": record.get("restaurant_id") or "",
+                               "payload": json.dumps(record),
+                               "saved_at": record["saved_at"],
+                               "tenant_id": record.get("tenant_id") or ""},
+                              key=("order_id",))
             self._conn.commit()
         return record
 
@@ -213,4 +200,3 @@ class SqliteOrderStore:
                 (tenant_id, limit),
             ).fetchall()
         return [json.loads(r[0]) for r in rows]
-        return [json.loads(row[0]) for row in rows]

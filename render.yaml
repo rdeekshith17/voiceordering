@@ -10,6 +10,10 @@ services:
     plan: free
     healthCheckPath: /health
     envVars:
+      # Free plan wipes the disk on every deploy/restart, so data lives in an
+      # outside Postgres (e.g. a free neon.tech database). See deploy/DEPLOY.md.
+      - key: DATABASE_URL
+        sync: false
       - key: PUBLIC_BASE_URL
         sync: false # paste your Render URL after first deploy, e.g. https://voiceorderai.onrender.com
       - key: VOICE_SECRET

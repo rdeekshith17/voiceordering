@@ -24,13 +24,12 @@ SEED_PHONE = os.environ.get("SEED_PHONE_NUMBER", "+15622680097")
 def main() -> None:
     from voiceorder.tenants.store import TenantStore
 
-    db_path = Path(
+    db_path = os.environ.get("DATABASE_URL", "").strip() or Path(
         os.environ.get(
             "VOICEORDER_DB",
             str(Path(__file__).resolve().parent.parent / "data" / "voiceorder.db"),
         )
     )
-    db_path.parent.mkdir(parents=True, exist_ok=True)
     store = TenantStore(db_path)
     existing = store.get_tenant_by_number(SEED_PHONE) or store.get_tenant_by_name(
         SEED_NAME

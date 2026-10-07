@@ -11,6 +11,7 @@ dependencies = [
     "anthropic>=0.40",
     "python-multipart>=0.0.9",  # Twilio webhooks post form-encoded bodies
     "cryptography>=40",  # Fernet encryption for tenant POS secrets at rest
+    "psycopg[binary]>=3.1",  # Postgres when DATABASE_URL is set (data survives redeploys)
 ]
 
 [project.optional-dependencies]

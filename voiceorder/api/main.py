@@ -43,6 +43,7 @@ from pydantic import BaseModel
 from ..agent.llm import AnthropicClient, MissingCredentials
 from ..agent.loop import AgentSession
 from ..core import tools
+from ..db import describe as describe_db, is_postgres
 from ..core.cart import CartState
 from ..core.catalog import Catalog
 from ..core.ports import RestaurantContext
@@ -220,15 +221,22 @@ pos = build_pos_adapter()
 adapter = TextAdapter()
 
 _storage_backend = os.environ.get("STORAGE_BACKEND", "sqlite").lower()
-_db_path = Path(
+# DATABASE_URL (postgres://...) keeps all data in Postgres, which survives
+# redeploys on hosts whose disk is wiped (e.g. Render's free plan). Without
+# it, everything lives in the SQLite file at VOICEORDER_DB.
+_db_path: str | Path = os.environ.get("DATABASE_URL", "").strip() or Path(
     os.environ.get(
         "VOICEORDER_DB", str(Path(__file__).resolve().parent.parent.parent / "data" / "voiceorder.db")
     )
 )
+if os.environ.get("RENDER") and not is_postgres(_db_path):
+    log.warning("DATABASE_URL is not set: on Render the SQLite file is wiped on every "
+                "deploy and restart, so orders, accounts and settings will be lost")
 if _storage_backend == "sqlite":
     cart_store = SqliteCartStore(_db_path)
     order_store = SqliteOrderStore(_db_path)
-    log.info("storage backend: sqlite (%s)", _db_path)
+    log.info("storage backend: %s (%s)", "postgres" if is_postgres(_db_path) else "sqlite",
+             describe_db(_db_path))
 else:
     cart_store = InMemoryCartStore()
     order_store = InMemoryOrderStore()
