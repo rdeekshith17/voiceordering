@@ -25,7 +25,7 @@ Auth: set VOICE_SECRET and every endpoint requires an X-Voice-Secret header
 set, the server logs a warning and allows local traffic.
 """
 from __future__ import annotations
-
+import itertools
 import logging
 import os
 import threading
@@ -33,8 +33,8 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from xml.sax.saxutils import escape as _xml_escape
-
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -694,8 +694,6 @@ def _twilio_signature_ok(request: Request, form: dict[str, str]) -> bool:
     return twilio_adapter.validate_signature(url, form, signature, token)
 
 
-
-
 def _public_base_url() -> str:
     base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     if not base.startswith("https://"):
@@ -810,6 +808,34 @@ async def twilio_voice(request: Request) -> Response:
     )
 
 
+# Varied filler phrases so the caller doesn't hear "One moment." on every turn.
+_FILLERS = (
+    "One moment.",
+    "Let me check that.",
+    "Got it, one second.",
+    "Looking into that.",
+)
+_filler_cycle = itertools.cycle(_FILLERS)
+
+
+def _filler_audio_url(filler: str, tenant_id: str) -> str | None:
+    """Public URL for a pre-synthesized filler clip, or None if not cached.
+
+    Never synthesizes here: the webhook must answer in milliseconds, so we
+    only use clips the startup pre-warm already rendered to the TTS cache.
+    """
+    try:
+        voice_id, model_id = _tenant_voice(tenant_id)
+        cleaned = " ".join(filler.split())
+        path = tts.cache_path(cleaned, voice_id, model_id)
+        if path.exists():
+            key = tts.cache_key(cleaned, voice_id, model_id)
+            return f"{_public_base_url()}/voice/audio/{key}.mp3"
+    except Exception:
+        log.warning("filler cache check failed", exc_info=True)
+    return None
+
+
 @app.post("/twilio/gather")
 async def twilio_gather(request: Request) -> Response:
     """Twilio webhook: the caller said something. Start one agent turn.
@@ -833,7 +859,8 @@ async def twilio_gather(request: Request) -> Response:
     if not speech:
         return _twiml_response(
             twilio_adapter.continue_call(
-                _speak_to_url("Sorry, I didn't catch that. What would you like to order?"),
+                _speak_to_url("Sorry, I didn't catch that. What would you like to order?",
+                              session.ctx.tenant_id),
                 "Sorry, I didn't catch that. What would you like to order?",
                 gather_url,
             )
@@ -847,10 +874,17 @@ async def twilio_gather(request: Request) -> Response:
     ).start()
     base = _public_base_url()
     poll_url = _xml_escape(f"{base}/twilio/turn?id={turn_id}&sid={call_sid}&n=0")
-    # Plain <Say> filler: no TTS latency, answers in milliseconds.
+    # Varied filler in the tenant's voice when cached; plain <Say> fallback
+    # keeps the webhook answering in milliseconds.
+    filler = next(_filler_cycle)
+    filler_audio = _filler_audio_url(filler, session.ctx.tenant_id)
+    if filler_audio:
+        spoken = f"<Play>{_xml_escape(filler_audio)}</Play>"
+    else:
+        spoken = f"<Say>{_xml_escape(filler)}</Say>"
     return _twiml_response(
         f'<?xml version="1.0" encoding="UTF-8"?><Response>'
-        f"<Say>One moment.</Say>"
+        f"{spoken}"
         f'<Redirect method="POST">{poll_url}</Redirect>'
         f"</Response>"
     )
@@ -922,7 +956,7 @@ async def twilio_turn(request: Request) -> Response:
                     gather_url,
                 )
             )
-        poll_url = _xml_escape(     f"{base}/twilio/turn?id={turn_id}&sid={call_sid}&n={poll_n + 1}" )
+        poll_url = _xml_escape(f"{base}/twilio/turn?id={turn_id}&sid={call_sid}&n={poll_n + 1}")
         return _twiml_response(
             f'<?xml version="1.0" encoding="UTF-8"?><Response>'
             f'<Pause length="1"/>'
@@ -1008,6 +1042,7 @@ class CallEndRequest(BaseModel):
 
 _APP_STARTED_AT = time.time()
 
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return """<!DOCTYPE html><html><head><meta charset="utf-8">
@@ -1023,8 +1058,6 @@ a.btn.alt{background:#5f6368}p{color:#555}</style></head><body>
 <a class="btn alt" href="/owner">Owner dashboard</a>
 <a class="btn alt" href="/chat">Text demo</a>
 </body></html>"""
-
-
 
 
 @app.get("/health")
@@ -1134,8 +1167,8 @@ def recent_orders(limit: int = 20, _auth: None = Depends(require_secret)) -> dic
 
 
 def _prewarm_tts_cache() -> None:
-    """Synthesize the static greeting at startup so the first caller
-    hears it instantly instead of waiting on a cold TTS request."""
+    """Synthesize the static greeting and filler phrases at startup so callers
+    hear them instantly instead of waiting on a cold TTS request."""
     try:
         greeting = (
             f"Thanks for calling {settings.restaurant_name}! "
@@ -1145,6 +1178,12 @@ def _prewarm_tts_cache() -> None:
         log.info("TTS cache pre-warmed with greeting")
     except Exception:
         log.warning("TTS pre-warm failed", exc_info=True)
+    for filler in _FILLERS:
+        try:
+            _speak_to_url(filler, default_tenant.id)
+        except Exception:
+            log.warning("filler pre-warm failed: %r", filler)
+    log.info("TTS cache pre-warmed with %d fillers", len(_FILLERS))
 
 
 # Started last: every name above (including _speak_to_url) is defined.
