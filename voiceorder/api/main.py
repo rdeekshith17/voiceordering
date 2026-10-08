@@ -294,13 +294,19 @@ def _seed_default_tenant() -> Tenant:
     if tenant is None:
         tenant = tenant_store.create_tenant(settings.restaurant_name, phone)
         log.info("tenancy: created default tenant %s (%s)", tenant.id, tenant.name)
-    tenant_store.set_settings(tenant.id, {
+    # Env values are first-boot defaults only: once a setting exists, the
+    # portal owns it, so a redeploy never undoes the owner's changes.
+    defaults = {
         "restaurant_name": settings.restaurant_name,
         "pos_profile": settings.pos_profile,
         "transfer_number": settings.transfer_number,
         "pickup_minutes": str(settings.pickup_minutes),
         "tax_rate": str(settings.tax_rate),
-    })
+    }
+    saved = tenant_store.get_settings(tenant.id)
+    missing = {k: v for k, v in defaults.items() if k not in saved}
+    if missing:
+        tenant_store.set_settings(tenant.id, missing)
     for provider in ("square", "toast", "clover"):
         if not tenant_store.has_secret(tenant.id, provider):
             creds = _env_pos_creds(provider)

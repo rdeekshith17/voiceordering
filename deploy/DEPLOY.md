@@ -31,7 +31,9 @@ idle spin-down, so data must live in an outside database.
    If you see `DATABASE_URL is not set` instead, the variable didn't save.
 4. Sign up again in the portal once (earlier data was already wiped), connect
    your POS, and set your time zone. From now on it survives deploys.
-5. Keep `TENANT_MASTER_KEY` unchanged forever: saved POS credentials are
+5. Make sure `TZ` is set to the restaurant's zone (e.g. `America/Chicago`);
+   otherwise pickup times told to callers are in UTC.
+6. Keep `TENANT_MASTER_KEY` unchanged forever: saved POS credentials are
    encrypted with it and can't be read with a different key.
 
 The free plan still sleeps after 15 minutes idle, so the first call after a
