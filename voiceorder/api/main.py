@@ -1282,3 +1282,13 @@ def _prewarm_tts_cache() -> None:
 
 # Started last: every name above (including _speak_to_url) is defined.
 threading.Thread(target=_prewarm_tts_cache, daemon=True).start()
+
+# Background agents (support, fraud, menu sync, billing, onboarding, QA,
+# marketing) run in-process when enabled; see voiceorder/agents/scheduler.py.
+if os.environ.get("AGENTS_ENABLED", "") == "1":
+    from ..agents import scheduler as agent_scheduler
+
+    agent_scheduler.start(tenant_store, agent_scheduler.build_jobs(
+        tenant_store, build_adapter=tenant_pos_adapter, get_catalog=tenant_catalog,
+        public_base_url=os.environ.get("PUBLIC_BASE_URL"),
+    ))
