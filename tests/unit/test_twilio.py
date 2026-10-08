@@ -112,6 +112,7 @@ class _FakeSession:
         self.cart = cart
         self.turns: list[str] = []
         self.ctx = api_main.restaurant_context()
+        self.caller = None
 
     def handle_caller_message(self, text: str) -> dict:
         self.turns.append(text)
@@ -141,7 +142,7 @@ def _voice_form(call_sid="CA123", **extra):
 def test_twilio_voice_answers_and_gathers(client, public_url, monkeypatch):
     cart = _FakeCart()
     monkeypatch.setattr(
-        api_main, "_new_twilio_session", lambda tenant=None: _FakeSession("hi", cart)
+        api_main, "_new_twilio_session", lambda tenant=None, caller_number="": _FakeSession("hi", cart)
     )
     resp = client.post("/twilio/voice", data=_voice_form())
     assert resp.status_code == 200
@@ -152,7 +153,7 @@ def test_twilio_voice_answers_and_gathers(client, public_url, monkeypatch):
 
 
 def test_twilio_voice_unavailable_without_llm(client, public_url, monkeypatch):
-    monkeypatch.setattr(api_main, "_new_twilio_session", lambda tenant=None: None)
+    monkeypatch.setattr(api_main, "_new_twilio_session", lambda tenant=None, caller_number="": None)
     resp = client.post("/twilio/voice", data=_voice_form())
     assert resp.status_code == 200
     assert "unavailable" in resp.text
@@ -313,7 +314,7 @@ def test_twilio_signature_enforced_when_configured(client, monkeypatch):
     resp = client.post("/twilio/voice", data=form)
     assert resp.status_code == 403
     # valid signature -> through (LLM unconfigured -> unavailable TwiML, not 403)
-    monkeypatch.setattr(api_main, "_new_twilio_session", lambda tenant=None: None)
+    monkeypatch.setattr(api_main, "_new_twilio_session", lambda tenant=None, caller_number="": None)
     sig = _sign("https://example.test/twilio/voice", form)
     resp = client.post(
         "/twilio/voice", data=form, headers={"X-Twilio-Signature": sig}

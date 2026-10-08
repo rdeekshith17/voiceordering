@@ -16,6 +16,9 @@ os.environ.setdefault("RESTAURANT_NAME", "Taqueria Demo")
 # Hermetic database: importing voiceorder.api.main seeds the default tenant
 # into this DB -- it must never be the production database.
 os.environ.setdefault("VOICEORDER_DB", f"/tmp/voiceorder_test_{os.getpid()}.db")
+# ...and never a Postgres from the developer's .env (that may be production):
+# an empty DATABASE_URL blocks _load_dotenv() from setting it.
+os.environ["DATABASE_URL"] = ""
 # Hermetic tenant key: tests must never read/write the production key file
 # (and therefore can never decrypt production tenant secrets).
 os.environ.setdefault(

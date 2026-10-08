@@ -32,6 +32,7 @@ from .. import net
 from ..core.cart import Cart
 from ..core.catalog import Catalog
 from ..core.ports import (
+    local_now,
     PaymentStep,
     PosCapabilities,
     PosError,
@@ -73,6 +74,7 @@ class SquarePosAdapter:
         catalog: Catalog,
         tax_rate: float = 0.0825,
         pickup_minutes: int = 20,
+        timezone: str = "",
     ) -> None:
         if not access_token:
             raise ValueError("SquarePosAdapter needs a SQUARE_ACCESS_TOKEN")
@@ -86,6 +88,7 @@ class SquarePosAdapter:
         self._catalog = catalog
         self._tax_rate = tax_rate
         self._pickup_minutes = pickup_minutes
+        self._timezone = timezone  # restaurant's zone for spoken pickup times
         self._orders: dict[str, PosOrder] = {}  # idempotency_key -> order
         self._payment_links: dict[str, str] = {}  # square order id -> pay URL
         # Invoices need the Square account to be enabled for card
@@ -140,7 +143,7 @@ class SquarePosAdapter:
         square_order = self._create_order(cart, idempotency_key)
         totals = self._totals_from_square(square_order) or self.quote(cart)
         order_id = str(square_order["id"])
-        pickup = (datetime.now() + timedelta(minutes=self._pickup_minutes)).strftime(
+        pickup = (local_now(self._timezone) + timedelta(minutes=self._pickup_minutes)).strftime(
             "%-I:%M %p"
         )
         order = PosOrder(

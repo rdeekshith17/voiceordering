@@ -6,7 +6,9 @@ at the edges, and each restaurant's config names its POS and voice platform.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 
 # ---------------------------------------------------------------------------
@@ -127,3 +129,16 @@ class PosAdapter(Protocol):
     def submit(self, cart: Any, idempotency_key: str) -> PosOrder: ...
     def payment_step(self, order: PosOrder) -> PaymentStep: ...
     def is_available(self, item_ref: str) -> bool: ...
+
+
+def local_now(timezone: str = "") -> datetime:
+    """Now in a restaurant's IANA time zone (e.g. "America/Chicago").
+
+    Falls back to the server clock (which honours the TZ env var) when the
+    zone is unset or unknown, so a bad setting never breaks an order."""
+    if timezone:
+        try:
+            return datetime.now(ZoneInfo(timezone))
+        except Exception:
+            pass
+    return datetime.now()

@@ -14,6 +14,9 @@ services:
       # outside Postgres (e.g. a free neon.tech database). See deploy/DEPLOY.md.
       - key: DATABASE_URL
         sync: false
+      # Clock for pickup times told to callers and in SMS receipts (else UTC).
+      - key: TZ
+        value: America/Chicago
       - key: PUBLIC_BASE_URL
         sync: false # paste your Render URL after first deploy, e.g. https://voiceorderai.onrender.com
       - key: VOICE_SECRET

@@ -98,12 +98,45 @@ SETTING_FIELDS = [
 # custom/cloned voice ID that overrides the dropdown on save.
 VOICE_SETTING_KEYS = {"voice_id", "voice_model", "voice_id_custom"}
 
-# Zones offered in System settings. Empty = the server's local clock.
-TIMEZONES = [
-    "America/New_York", "America/Chicago", "America/Denver", "America/Phoenix",
-    "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu",
-    "Europe/London", "Asia/Kolkata", "UTC",
+# Zones a restaurant can pick (signup + System settings). Each restaurant's
+# zone sets the pickup times the AI tells callers and the times in the portal.
+# Empty = the server's clock.
+TIMEZONES: list[tuple[str, str]] = [
+    ("America/New_York", "Eastern Time (New York, Atlanta, Miami)"),
+    ("America/Chicago", "Central Time (Chicago, Dallas, Houston)"),
+    ("America/Denver", "Mountain Time (Denver, Salt Lake City)"),
+    ("America/Phoenix", "Arizona (Phoenix, no daylight saving)"),
+    ("America/Los_Angeles", "Pacific Time (Los Angeles, Seattle)"),
+    ("America/Anchorage", "Alaska (Anchorage)"),
+    ("Pacific/Honolulu", "Hawaii (Honolulu)"),
+    ("America/Halifax", "Atlantic Time (Halifax)"),
+    ("America/St_Johns", "Newfoundland (St. John's)"),
+    ("America/Toronto", "Eastern Time, Canada (Toronto)"),
+    ("America/Vancouver", "Pacific Time, Canada (Vancouver)"),
+    ("Europe/London", "UK (London)"),
+    ("Asia/Kolkata", "India (Kolkata, Hyderabad)"),
+    ("Asia/Dubai", "UAE (Dubai)"),
+    ("Asia/Singapore", "Singapore"),
+    ("Australia/Sydney", "Australia Eastern (Sydney)"),
+    ("UTC", "UTC"),
 ]
+TIMEZONE_IDS = {z for z, _ in TIMEZONES}
+
+
+def _tz_options(selected: str, blank_label: str) -> str:
+    opts = f"<option value=''>{_e(blank_label)}</option>" if blank_label else ""
+    return opts + "".join(
+        f"<option value='{z}'{' selected' if z == selected else ''}>{_e(label)}</option>"
+        for z, label in TIMEZONES)
+
+
+# Preselects the visitor's own zone in a blank time-zone <select> (if offered).
+_TZ_GUESS_JS = """<script>(function(){try{
+  var s=document.querySelector('select[name=timezone]'); if(!s||s.value) return;
+  var z=Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if([].some.call(s.options,function(o){return o.value===z;})){s.value=z;
+    var n=document.getElementById('tz-guess'); if(n) n.hidden=false;}
+}catch(e){}})();</script>"""
 
 # A call still marked live after this long without a turn lost its status webhook.
 _LIVE_STALE_SECONDS = 1800
@@ -320,10 +353,13 @@ def _signup_page(platform: str, error: str = "") -> str:
 <label class="f">Restaurant name</label><input name=restaurant required placeholder="Hyderabad House">
 <label class="f">Twilio phone number</label><input name=phone placeholder="+15622680097">
 <p class="help">The Twilio number customers call — calls to it route to you.</p>
+<label class="f">Time zone</label><select name=timezone required>{_tz_options("", "Choose your restaurant's time zone")}</select>
+<p class="help">Pickup times the AI tells your callers use this zone.</p>
 <label class="f">Your email</label><input name=email type=email required autocomplete=email>
 <label class="f">Password (8+ characters)</label><input name=password type=password required minlength=8 autocomplete=new-password>
 <div class="actions"><button class="btn block" type=submit>Create account</button></div></form>
-<p class="mut small" style="margin:20px 0 0"><a href="/portal/login">Already have an account? Log in</a></p>"""
+<p class="mut small" style="margin:20px 0 0"><a href="/portal/login">Already have an account? Log in</a></p>
+{_TZ_GUESS_JS}"""
     return ui.auth_shell("Sign up", body, platform)
 
 
@@ -554,6 +590,16 @@ def _orders_page(deps: PortalDeps, tenant: Tenant) -> str:
 
 def _settings_page(deps: PortalDeps, tenant: Tenant, user: PortalUser | None = None,
                    saved: bool = False) -> str:
+    cur_tz = tenant.setting("timezone", "")
+    tz_label = dict(TIMEZONES).get(cur_tz, "")
+    now_there = _hm(_dt(time.time(), _tz(tenant))) if cur_tz else ""
+    tz_block = (
+        "<label class='f'>Time zone</label>"
+        f"<select name='timezone'>{_tz_options(cur_tz, 'Not set (uses the server clock)')}</select>"
+        "<p class='help'>Pickup times the AI tells callers, text receipts, and every time in this"
+        " portal use this zone." + (f" It's {now_there} there now." if now_there else "") + "</p>"
+        + ("" if cur_tz else "<p class='help' id='tz-guess' hidden>Suggested from your browser."
+           " Click Save changes to apply it.</p>"))
     fields = ""
     for f in SETTING_FIELDS:
         val = tenant.setting(f["key"], "")
@@ -563,9 +609,8 @@ def _settings_page(deps: PortalDeps, tenant: Tenant, user: PortalUser | None = N
                    f"<input name='{f['key']}' value='{_e(val)}'"
                    f" placeholder='{_e(f.get('placeholder', ''))}'>"
                    + (f"<p class='help'>{f['help']}</p>" if f.get("help") else ""))
-    cur_tz = tenant.setting("timezone", "")
-    tz_opts = "<option value=''>Server default</option>" + "".join(
-        f"<option{' selected' if z == cur_tz else ''}>{z}</option>" for z in TIMEZONES)
+        if f["key"] == "restaurant_name":
+            fields += tz_block
     cur_voice = tenant.setting("voice_id", "") or voice_catalog.DEFAULT_VOICE_ID
     cur_model = tenant.setting("voice_model", "") or voice_catalog.DEFAULT_MODEL_ID
     known_ids = {v[0] for v in voice_catalog.ELEVENLABS_VOICES}
@@ -589,8 +634,6 @@ def _settings_page(deps: PortalDeps, tenant: Tenant, user: PortalUser | None = N
 <div id=settings-msg></div>
 <div class="grid-main"><form id=settings-form>
 <h3 class="sec-h">Restaurant details</h3>{fields}
-<label class="f">Time zone</label><select name="timezone">{tz_opts}</select>
-<p class="help">Used for order times, "today", and the daily charts.</p>
 <h3 class="sec-h" style="margin-top:44px">AI voice</h3>
 <p class="mut small" style="margin:-10px 0 0">The voice callers hear when they phone your restaurant.
 Preview a voice before saving — each preview uses a few dozen characters of your ElevenLabs monthly budget.</p>
@@ -608,11 +651,13 @@ Preview a voice before saving — each preview uses a few dozen characters of yo
 <div><h3 class="sec-h">Workspace</h3>
 <div class="kv"><span>Restaurant</span><b>{_e(tenant.name)}</b></div>
 <div class="kv"><span>Phone number</span><b>{_e(phone) or "—"}</b></div>
+<div class="kv"><span>Time zone</span><b>{_e(tz_label) or '<span class="pill warn">Not set</span>'}</b></div>
 <div class="kv"><span>Point of sale</span><b>{_e(pos_label) or "—"} <span class="pill {'ok' if connected else 'warn'}">{'Connected' if connected else 'Not connected'}</span></b></div>
 <div class="kv"><span>AI voice</span><b>{_e(voice_name)}</b></div>
 <div class="kv"><span>Voice provider</span><b>Twilio</b></div>
 {f'<div class="kv"><span>Signed in as</span><b>{_e(user.email)}</b></div>' if user else ''}
 <a class="btn ghost" style="margin-top:24px" href="/portal/logout">{icon("logout", 18)}Log out</a></div></div>
+{_TZ_GUESS_JS if not cur_tz else ""}
 <script>
 document.getElementById('settings-form').addEventListener('submit', async e => {{
   e.preventDefault();
@@ -1095,7 +1140,8 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             tenant = (deps.tenants.get_tenant_by_number(phone)
                       if phone else None)
             if tenant is not None and deps.tenants.count_users(tenant.id) > 0:
-                tenant = None
+                raise ValueError("A restaurant account already uses this phone number. "
+                                 "Log in instead, or sign up with a different number.")
             if tenant is None:
                 tenant = deps.tenants.create_tenant(name, phone)
                 deps.tenants.set_settings(tenant.id, {
@@ -1105,6 +1151,9 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             user = deps.tenants.create_user(
                 tenant.id, str(form.get("email", "")), str(form.get("password", ""))
             )
+            zone = str(form.get("timezone", ""))
+            if zone in TIMEZONE_IDS:
+                deps.tenants.set_settings(tenant.id, {"timezone": zone})
         except ValueError as exc:
             return HTMLResponse(_signup_page(deps.platform_name, str(exc)),
                                 status_code=400)
@@ -1364,7 +1413,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
                                 status_code=400)
         if "voice_model" in values and not voice_catalog.is_known_model(values["voice_model"]):
             return JSONResponse({"ok": False, "error": "unknown voice model"}, status_code=400)
-        if values.get("timezone") and values["timezone"] not in TIMEZONES:
+        if values.get("timezone") and values["timezone"] not in TIMEZONE_IDS:
             return JSONResponse({"ok": False, "error": "unknown time zone"}, status_code=400)
         if "pickup_minutes" in values:
             try:
@@ -1378,7 +1427,10 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             except ValueError:
                 values.pop("tax_rate")
         if values.get("phone_number"):
-            deps.tenants.set_phone_number(tenant.id, values["phone_number"])
+            try:
+                deps.tenants.set_phone_number(tenant.id, values["phone_number"])
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         deps.tenants.set_settings(tenant.id, values)
         deps.on_config_changed(tenant.id)
         return {"ok": True}

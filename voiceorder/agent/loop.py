@@ -31,6 +31,7 @@ class AgentSession:
         ctx: RestaurantContext,
         cart: Cart,
         model: str,
+        caller: dict | None = None,
     ):
         self.llm = llm
         self.catalog = catalog
@@ -38,7 +39,8 @@ class AgentSession:
         self.ctx = ctx
         self.cart = cart
         self.model = model
-        self.system = build_system_prompt(catalog, ctx)
+        self.caller = caller  # {"phone", "name", "order_count", "last_order"} or None
+        self.system = build_system_prompt(catalog, ctx, caller)
         self.tool_schemas = build_tool_schemas()
         self.history: list[dict] = []
 

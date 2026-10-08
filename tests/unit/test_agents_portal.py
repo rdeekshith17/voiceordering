@@ -120,3 +120,26 @@ def test_portal_json_apis(tmp_path):
         r = client.get(path)
         assert r.status_code == 200, path
         assert len(r.json()[key]) == 1, path
+
+
+# --- duplicate phone numbers ---------------------------------------------------
+def test_signup_with_a_claimed_number_shows_an_error_not_a_500(tmp_path):
+    client, store, tenant = _login_client(tmp_path)
+    other = TestClient(client.app, follow_redirects=False)
+    r = other.post("/portal/signup", data={
+        "restaurant": "Taco Palace 2", "phone": "(555) 123-4567",
+        "email": "someone@example.com", "password": "s3cur3pass"})
+    assert r.status_code == 400
+    assert "already uses this phone number" in r.text and "Log in" in r.text
+    assert store.get_tenant_by_name("Taco Palace 2") is None
+    assert store.verify_user("someone@example.com", "s3cur3pass") is None
+
+
+def test_settings_cannot_take_another_restaurants_number(tmp_path):
+    client, store, tenant = _login_client(tmp_path)
+    store.create_tenant("Burger Barn", "+15559990000")
+    r = client.post("/portal/api/settings", json={"phone_number": "+1 555 999 0000"})
+    assert r.status_code == 400 and "already registered" in r.json()["error"]
+    assert store.get_tenant(tenant.id).phone_number == "5551234567"
+    with pytest.raises(ValueError):
+        store.create_tenant("Burger Barn 2", "5559990000")
