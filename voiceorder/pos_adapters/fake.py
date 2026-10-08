@@ -23,6 +23,7 @@ from pathlib import Path
 from ..core.cart import Cart
 from ..core.catalog import Catalog
 from ..core.ports import (
+    local_now,
     PaymentStep,
     PosCapabilities,
     PosError,
@@ -55,6 +56,7 @@ class FakePos:
         catalog: Catalog | None = None,
         mode: str = "ok",
         tax_rate: float = 0.0825,
+        timezone: str = "",
         sold_out: tuple[str, ...] = (),
     ):
         if profile not in PROFILES:
@@ -64,6 +66,7 @@ class FakePos:
         self.profile = profile
         self.mode = mode
         self.tax_rate = tax_rate
+        self._timezone = timezone  # restaurant's zone for spoken pickup times
         self._catalog = catalog or Catalog.from_json(FIXTURE)
         self._sold_out = set(sold_out)
         self._orders: dict[str, PosOrder] = {}  # idempotency_key -> order
@@ -117,7 +120,7 @@ class FakePos:
             self._check_modifiers_linked(cart)
         totals = self.quote(cart)
         self._seq += 1
-        pickup = (datetime.now() + timedelta(minutes=20)).strftime("%-I:%M %p")
+        pickup = (local_now(self._timezone) + timedelta(minutes=20)).strftime("%-I:%M %p")
         status = (
             "pending_payment"
             if self.profile == "square_like"

@@ -36,6 +36,7 @@ from .. import net
 from ..core.cart import Cart
 from ..core.catalog import Catalog
 from ..core.ports import (
+    local_now,
     PaymentStep,
     PosCapabilities,
     PosError,
@@ -66,6 +67,7 @@ class CloverPosAdapter:
         catalog: Catalog,
         tax_rate: float = 0.0825,
         pickup_minutes: int = 20,
+        timezone: str = "",
     ) -> None:
         if not access_token:
             raise ValueError("CloverPosAdapter needs a CLOVER_ACCESS_TOKEN")
@@ -78,6 +80,7 @@ class CloverPosAdapter:
         self._catalog = catalog
         self._tax_rate = tax_rate
         self._pickup_minutes = pickup_minutes
+        self._timezone = timezone  # restaurant's zone for spoken pickup times
         self._orders: dict[str, PosOrder] = {}  # idempotency_key -> order
 
     # -- PosAdapter ---------------------------------------------------------
@@ -118,7 +121,7 @@ class CloverPosAdapter:
         order_id = self._create_order(cart)
         for line in cart.lines:
             self._add_line_item(order_id, line)
-        pickup = (datetime.now() + timedelta(minutes=self._pickup_minutes)).strftime(
+        pickup = (local_now(self._timezone) + timedelta(minutes=self._pickup_minutes)).strftime(
             "%-I:%M %p"
         )
         order = PosOrder(

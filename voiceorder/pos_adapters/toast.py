@@ -52,6 +52,7 @@ from .. import net
 from ..core.cart import Cart
 from ..core.catalog import Catalog
 from ..core.ports import (
+    local_now,
     PaymentStep,
     PosCapabilities,
     PosError,
@@ -84,6 +85,7 @@ class ToastPosAdapter:
         catalog: Catalog,
         tax_rate: float = 0.0825,
         pickup_minutes: int = 20,
+        timezone: str = "",
     ) -> None:
         if not client_id or not client_secret:
             raise ValueError(
@@ -101,6 +103,7 @@ class ToastPosAdapter:
         self._catalog = catalog
         self._tax_rate = tax_rate
         self._pickup_minutes = pickup_minutes
+        self._timezone = timezone  # restaurant's zone for spoken pickup times
         self._token: str | None = None
         self._orders: dict[str, PosOrder] = {}  # idempotency_key -> order
         self._quoted: set[str] = set()  # cart ids with a fresh price quote
@@ -170,7 +173,7 @@ class ToastPosAdapter:
         guid = str(toast_order.get("guid") or "")
         if not guid:
             raise PosError("Toast returned no order guid")
-        pickup = (datetime.now() + timedelta(minutes=self._pickup_minutes)).strftime(
+        pickup = (local_now(self._timezone) + timedelta(minutes=self._pickup_minutes)).strftime(
             "%-I:%M %p"
         )
         order = PosOrder(

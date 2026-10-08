@@ -129,7 +129,7 @@ class Settings:
 settings = Settings()
 
 
-def build_pos_adapter():
+def build_pos_adapter(timezone: str = ""):
     """POS adapter for the configured profile.
 
     POS_PROFILE=square uses the real Square REST adapter (needs
@@ -148,6 +148,7 @@ def build_pos_adapter():
             catalog=catalog,
             tax_rate=settings.tax_rate,
             pickup_minutes=settings.pickup_minutes,
+            timezone=timezone,
         )
     if settings.pos_profile == "toast":
         if not (
@@ -168,6 +169,7 @@ def build_pos_adapter():
             catalog=catalog,
             tax_rate=settings.tax_rate,
             pickup_minutes=settings.pickup_minutes,
+            timezone=timezone,
         )
     if settings.pos_profile == "clover":
         if not settings.clover_access_token or not settings.clover_merchant_id:
@@ -182,10 +184,12 @@ def build_pos_adapter():
             catalog=catalog,
             tax_rate=settings.tax_rate,
             pickup_minutes=settings.pickup_minutes,
+            timezone=timezone,
         )
     if settings.pos_profile not in PROFILES:
         raise RuntimeError(f"unknown POS_PROFILE={settings.pos_profile}")
-    return FakePos(profile=settings.pos_profile, catalog=catalog, tax_rate=settings.tax_rate)
+    return FakePos(profile=settings.pos_profile, catalog=catalog, tax_rate=settings.tax_rate,
+                   timezone=timezone)
 
 
 def _load_catalog() -> Catalog:
@@ -329,7 +333,7 @@ def _tenant_fingerprint(tenant: Tenant, creds: dict) -> str:
     s = tenant.settings
     return "|".join([
         tenant.id, s.get("pos_profile", ""), s.get("tax_rate", ""),
-        s.get("pickup_minutes", ""),
+        s.get("pickup_minutes", ""), s.get("timezone", ""),
         str(sorted((k, str(v)) for k, v in creds.items() if "token" not in k and "secret" not in k)),
     ])
 
@@ -348,6 +352,7 @@ def tenant_pos_adapter(tenant: Tenant, override: dict | None = None) -> Any:
             creds = _env_pos_creds(provider)  # legacy fallback
     tax_rate = float(tenant.setting("tax_rate", "") or settings.tax_rate)
     pickup_minutes = int(tenant.setting("pickup_minutes", "") or settings.pickup_minutes)
+    timezone = tenant.setting("timezone", "")
     cat = tenant_catalog(tenant)
     if provider == "square":
         if not creds.get("access_token") or not creds.get("location_id"):
@@ -357,6 +362,7 @@ def tenant_pos_adapter(tenant: Tenant, override: dict | None = None) -> Any:
             location_id=creds["location_id"],
             environment=creds.get("environment", "production"),
             catalog=cat, tax_rate=tax_rate, pickup_minutes=pickup_minutes,
+            timezone=timezone,
         )
     if provider == "toast":
         if not (creds.get("client_id") and creds.get("client_secret")
@@ -369,6 +375,7 @@ def tenant_pos_adapter(tenant: Tenant, override: dict | None = None) -> Any:
             environment=creds.get("environment", "production"),
             takeout_dining_guid=creds.get("takeout_dining_guid", ""),
             catalog=cat, tax_rate=tax_rate, pickup_minutes=pickup_minutes,
+            timezone=timezone,
         )
     if provider == "clover":
         if not creds.get("access_token") or not creds.get("merchant_id"):
@@ -378,11 +385,12 @@ def tenant_pos_adapter(tenant: Tenant, override: dict | None = None) -> Any:
             merchant_id=creds["merchant_id"],
             environment=creds.get("environment", "production"),
             catalog=cat, tax_rate=tax_rate, pickup_minutes=pickup_minutes,
+            timezone=timezone,
         )
     # fake profiles (dev / demo tenants)
     if provider not in PROFILES:
         raise RuntimeError(f"unknown POS profile: {provider}")
-    return FakePos(profile=provider, catalog=cat, tax_rate=tax_rate)
+    return FakePos(profile=provider, catalog=cat, tax_rate=tax_rate, timezone=timezone)
 
 
 def cached_tenant_adapter(tenant: Tenant) -> Any:
@@ -567,7 +575,7 @@ def chat_start() -> ChatStartResponse:
         raise HTTPException(status_code=503, detail="set ANTHROPIC_MODEL to an Anthropic model id")
     ctx = restaurant_context()
     session_id = uuid.uuid4().hex[:12]
-    chat_pos = build_pos_adapter()
+    chat_pos = build_pos_adapter(tenant_store.get_tenant(default_tenant.id).setting("timezone", ""))
     cart = cart_store.create(ctx.restaurant_id)
     session = AgentSession(llm, catalog, chat_pos, ctx, cart, model)
     _chat_sessions[session_id] = session
