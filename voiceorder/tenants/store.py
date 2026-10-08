@@ -157,11 +157,21 @@ class TenantStore:
         return conn
 
     # -- tenants -----------------------------------------------------------
+    def _number_taken(self, phone: str, by_other_than: str = "") -> bool:
+        """True when another tenant already owns this normalized number."""
+        row = self._conn.execute(
+            "SELECT id FROM tenants WHERE phone_number = ? AND id != ?",
+            (phone, by_other_than),
+        ).fetchone()
+        return row is not None
+
     def create_tenant(self, name: str, phone_number: str = "") -> Tenant:
         tid = uuid.uuid4().hex[:12]
         slug = "".join(c if c.isalnum() else "-" for c in name.lower()).strip("-") or tid
         phone = normalize_number(phone_number)
         with self._lock:
+            if phone and self._number_taken(phone):
+                raise ValueError("that phone number is already registered to another restaurant")
             # unique-ify slug
             base, n = slug, 2
             while self._conn.execute(
@@ -202,7 +212,10 @@ class TenantStore:
         return self.get_tenant(row[0]) if row else None
 
     def set_phone_number(self, tenant_id: str, phone_number: str) -> None:
+        phone = normalize_number(phone_number)
         with self._lock:
+            if phone and self._number_taken(phone, by_other_than=tenant_id):
+                raise ValueError("that phone number is already registered to another restaurant")
             self._conn.execute(
                 "UPDATE tenants SET phone_number = ? WHERE id = ?",
                 (normalize_number(phone_number) or None, tenant_id),

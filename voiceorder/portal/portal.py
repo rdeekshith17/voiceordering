@@ -1095,7 +1095,8 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             tenant = (deps.tenants.get_tenant_by_number(phone)
                       if phone else None)
             if tenant is not None and deps.tenants.count_users(tenant.id) > 0:
-                tenant = None
+                raise ValueError("A restaurant account already uses this phone number. "
+                                 "Log in instead, or sign up with a different number.")
             if tenant is None:
                 tenant = deps.tenants.create_tenant(name, phone)
                 deps.tenants.set_settings(tenant.id, {
@@ -1378,7 +1379,10 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             except ValueError:
                 values.pop("tax_rate")
         if values.get("phone_number"):
-            deps.tenants.set_phone_number(tenant.id, values["phone_number"])
+            try:
+                deps.tenants.set_phone_number(tenant.id, values["phone_number"])
+            except ValueError as exc:
+                return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
         deps.tenants.set_settings(tenant.id, values)
         deps.on_config_changed(tenant.id)
         return {"ok": True}
