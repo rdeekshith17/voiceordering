@@ -118,6 +118,17 @@ class TenantStore:
             );
             CREATE INDEX IF NOT EXISTS idx_drafts_tenant
               ON marketing_drafts (tenant_id, created_at DESC);
+            -- callers remembered per restaurant, keyed by normalized phone
+            CREATE TABLE IF NOT EXISTS customers (
+              tenant_id TEXT NOT NULL,
+              phone TEXT NOT NULL,
+              name TEXT NOT NULL DEFAULT '',
+              order_count INTEGER NOT NULL DEFAULT 0,
+              last_order TEXT NOT NULL DEFAULT '',
+              first_seen REAL NOT NULL,
+              last_seen REAL NOT NULL,
+              PRIMARY KEY (tenant_id, phone)
+            );
             CREATE TABLE IF NOT EXISTS usage_daily (
               tenant_id TEXT NOT NULL,
               date TEXT NOT NULL,
@@ -568,6 +579,54 @@ class TenantStore:
                 (tenant_id, since_ts),
             ).fetchone()
         return row[0] if row else 0
+
+    # -- customers (returning-caller memory) -------------------------------
+    def get_customer(self, tenant_id: str, phone: str) -> dict | None:
+        """A remembered caller of this restaurant, by any format of their number."""
+        number = normalize_number(phone)
+        if not number:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT phone, name, order_count, last_order, first_seen, last_seen"
+                " FROM customers WHERE tenant_id = ? AND phone = ?",
+                (tenant_id, number),
+            ).fetchone()
+        if not row:
+            return None
+        return {"phone": row[0], "name": row[1], "order_count": row[2],
+                "last_order": row[3], "first_seen": row[4], "last_seen": row[5]}
+
+    def record_customer(self, tenant_id: str, phone: str, name: str = "",
+                        last_order: str = "", ordered: bool = False,
+                        now: float | None = None) -> dict | None:
+        """Create or update a caller. Blank name/last_order keep what was saved."""
+        number = normalize_number(phone)
+        if not number:
+            return None
+        now = now if now is not None else time.time()
+        existing = self.get_customer(tenant_id, number) or {}
+        row = {
+            "tenant_id": tenant_id, "phone": number,
+            "name": (name or "").strip()[:80] or existing.get("name", ""),
+            "order_count": int(existing.get("order_count", 0)) + (1 if ordered else 0),
+            "last_order": (last_order or "").strip()[:300] or existing.get("last_order", ""),
+            "first_seen": existing.get("first_seen", now), "last_seen": now,
+        }
+        with self._lock:
+            self._conn.upsert("customers", row, key=("tenant_id", "phone"))
+            self._conn.commit()
+        return self.get_customer(tenant_id, number)
+
+    def list_customers(self, tenant_id: str, limit: int = 50) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT phone, name, order_count, last_order, first_seen, last_seen"
+                " FROM customers WHERE tenant_id = ? ORDER BY last_seen DESC LIMIT ?",
+                (tenant_id, limit),
+            ).fetchall()
+        return [{"phone": r[0], "name": r[1], "order_count": r[2], "last_order": r[3],
+                 "first_seen": r[4], "last_seen": r[5]} for r in rows]
 
     # -- usage metering ----------------------------------------------------
     def upsert_usage(self, tenant_id: str, date: str, calls: int,

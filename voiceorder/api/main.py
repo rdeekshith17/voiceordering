@@ -58,7 +58,7 @@ from ..voice_adapters import twilio as twilio_adapter
 from ..voice_adapters.text import TextAdapter
 from .owner import OwnerDeps, build_owner_router
 from ..portal.portal import PortalDeps, build_portal_router
-from ..tenants.store import Tenant, TenantStore
+from ..tenants.store import Tenant, TenantStore, normalize_number
 from .storage import (
     InMemoryCartStore,
     InMemoryOrderStore,
@@ -380,10 +380,9 @@ def tenant_pos_adapter(tenant: Tenant, override: dict | None = None) -> Any:
             catalog=cat, tax_rate=tax_rate, pickup_minutes=pickup_minutes,
         )
     # fake profiles (dev / demo tenants)
-    profile = PROFILES.get(provider)
-    if profile is None:
+    if provider not in PROFILES:
         raise RuntimeError(f"unknown POS profile: {provider}")
-    return FakePos(profile, catalog=cat)
+    return FakePos(profile=provider, catalog=cat, tax_rate=tax_rate)
 
 
 def cached_tenant_adapter(tenant: Tenant) -> Any:
@@ -572,6 +571,10 @@ def chat_start() -> ChatStartResponse:
     cart = cart_store.create(ctx.restaurant_id)
     session = AgentSession(llm, catalog, chat_pos, ctx, cart, model)
     _chat_sessions[session_id] = session
+    try:  # web chats are kept like phone calls, so owners can read them
+        tenant_store.start_call(_chat_call_id(session_id), ctx.tenant_id, "Web chat", "")
+    except Exception:
+        log.warning("chat %s: transcript start failed", session_id, exc_info=True)
     return ChatStartResponse(
         session_id=session_id, greeting=adapter.call_start_response(ctx)["greeting"]
     )
@@ -584,13 +587,28 @@ def chat_message(req: ChatMessageRequest) -> dict:
         raise HTTPException(status_code=404, detail="unknown chat session")
     turn = session.handle_caller_message(req.text)
     cart = session.cart
+    call_id = _chat_call_id(req.session_id)
+    try:
+        tenant_store.append_turn(call_id, req.text, turn["text"], turn.get("tool_calls") or [])
+    except Exception:
+        log.warning("chat %s: transcript append failed", req.session_id, exc_info=True)
     if cart.transferred or cart.state == CartState.SUBMITTED:
         _chat_sessions.pop(req.session_id, None)
+        if cart.state == CartState.SUBMITTED:
+            _persist_submitted_order(cart, call_id, session.ctx)
+        try:
+            tenant_store.end_call(call_id, "completed")
+        except Exception:
+            log.warning("chat %s: transcript close failed", req.session_id, exc_info=True)
     return {
         "reply": turn["text"],
         "cart_state": cart.state.value,
         "transferred": cart.transferred,
     }
+
+
+def _chat_call_id(session_id: str) -> str:
+    return f"WEB-{session_id}"
 
 
 class CallStartRequest(BaseModel):
@@ -718,7 +736,29 @@ def _public_base_url() -> str:
     return base
 
 
-def _new_twilio_session(tenant: Tenant | None = None) -> AgentSession | None:
+def _caller_profile(tenant: Tenant, caller_number: str) -> dict | None:
+    """What we remember about a caller: their saved customer record, or just
+    the caller ID for a first-time caller. None when the number is hidden."""
+    if not normalize_number(caller_number):
+        return None
+    try:
+        return tenant_store.get_customer(tenant.id, caller_number) or {"phone": caller_number}
+    except Exception:
+        log.warning("customer lookup failed for tenant %s", tenant.id, exc_info=True)
+        return {"phone": caller_number}
+
+
+def _greeting(ctx: RestaurantContext, caller: dict | None) -> str:
+    greeting = adapter.call_start_response(ctx)["greeting"]
+    first = ((caller or {}).get("name") or "").split(" ")[0].strip()
+    if first and first.replace("-", "").replace("'", "").isalpha():
+        greeting = (f"Thanks for calling {ctx.restaurant_name}! Welcome back, {first}. "
+                    "This call may be recorded. What can I get started for you?")
+    return greeting
+
+
+def _new_twilio_session(tenant: Tenant | None = None,
+                        caller_number: str = "") -> AgentSession | None:
     """One agent brain per phone call, wired to the tenant being called."""
     try:
         llm = _chat_llm_client()
@@ -732,7 +772,8 @@ def _new_twilio_session(tenant: Tenant | None = None) -> AgentSession | None:
     call_pos = cached_tenant_adapter(tenant)
     cat = tenant_catalog(tenant)
     cart = cart_store.create(ctx.restaurant_id)
-    return AgentSession(llm, cat, call_pos, ctx, cart, model)
+    return AgentSession(llm, cat, call_pos, ctx, cart, model,
+                        caller=_caller_profile(tenant, caller_number))
 
 
 def _tenant_voice(tenant_id: str = "") -> tuple[str, str]:
@@ -803,7 +844,7 @@ async def twilio_voice(request: Request) -> Response:
     if not call_sid:
         raise HTTPException(status_code=400, detail="missing CallSid")
     tenant = resolve_call_tenant(str(form.get("To", "")))
-    session = _new_twilio_session(tenant)
+    session = _new_twilio_session(tenant, str(form.get("From", "")))
     if session is None:
         log.warning("twilio call %s: LLM not configured", call_sid)
         return _twiml_response(twilio_adapter.unavailable())
@@ -812,11 +853,12 @@ async def twilio_voice(request: Request) -> Response:
         call_sid, tenant.id, str(form.get("From", "")), str(form.get("To", ""))
     )
     ctx = tenant_context(tenant)
-    greeting = adapter.call_start_response(ctx)["greeting"]
+    greeting = _greeting(ctx, session.caller)
     base = _public_base_url()
     gather_url = f"{base}/twilio/gather"
-    log.info("twilio call started: %s from %s (tenant %s)",
-             call_sid, form.get("From"), tenant.name)
+    log.info("twilio call started: %s from %s (tenant %s%s)",
+             call_sid, form.get("From"), tenant.name,
+             ", returning customer" if (session.caller or {}).get("name") else "")
     return _twiml_response(
         twilio_adapter.answer_call(_speak_to_url(greeting, tenant.id), greeting, gather_url)
     )
@@ -1010,7 +1052,7 @@ def _twilio_final_twiml(
         )
     if cart.state == CartState.SUBMITTED:
         from_number = str(form.get("From", ""))
-        _persist_submitted_order(cart, call_sid, session.ctx)
+        _persist_submitted_order(cart, call_sid, session.ctx, caller_number=from_number)
         if from_number:
             _send_receipt_sms(from_number, cart, session.ctx.restaurant_name)
         log.info("twilio call %s: order submitted", call_sid)
@@ -1099,7 +1141,8 @@ def call_start(req: CallStartRequest, _auth: None = Depends(require_secret)) -> 
     return response
 
 
-def _persist_submitted_order(cart, call_id: str, ctx: RestaurantContext) -> None:
+def _persist_submitted_order(cart, call_id: str, ctx: RestaurantContext,
+                             caller_number: str = "") -> None:
     """Record a submitted order in the order store.
 
     Single choke point: the /tools/submit_order endpoint AND the Twilio
@@ -1127,6 +1170,30 @@ def _persist_submitted_order(cart, call_id: str, ctx: RestaurantContext) -> None
     )
     state = getattr(getattr(cart, "state", None), "value", "?")
     log.info("order %s submitted on %s (state=%s)", order.get("order_number"), call_id, state)
+    _remember_customer(cart, ctx, caller_number)
+
+
+def _remember_customer(cart, ctx: RestaurantContext, caller_number: str = "") -> None:
+    """Save who ordered (name, numbers, what they had) so the next call from
+    their number is greeted by name. Caller ID wins over a spoken number; a
+    different spoken number is saved too. Never breaks the order."""
+    if not ctx.tenant_id:
+        return
+    name = getattr(cart, "customer_name", None) or ""
+    summary = ", ".join(
+        f"{line.quantity} {line.item_name}" for line in (getattr(cart, "lines", None) or []))
+    spoken = getattr(cart, "customer_phone", None) or ""
+    numbers = [n for n in (caller_number, spoken) if normalize_number(n)]
+    seen: set[str] = set()
+    for number in numbers:
+        if normalize_number(number) in seen:
+            continue
+        seen.add(normalize_number(number))
+        try:
+            tenant_store.record_customer(ctx.tenant_id, number, name=name,
+                                         last_order=summary, ordered=True)
+        except Exception:
+            log.warning("could not save customer for tenant %s", ctx.tenant_id, exc_info=True)
 
 
 @app.post("/tools/{name}")
