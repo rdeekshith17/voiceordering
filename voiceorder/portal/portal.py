@@ -588,6 +588,48 @@ def _orders_page(deps: PortalDeps, tenant: Tenant) -> str:
     return _page(deps, tenant, "orders", "Orders", body)
 
 
+def _customers_page(deps: PortalDeps, tenant: Tenant) -> str:
+    tz, now = _tz(tenant), time.time()
+    customers = deps.tenants.list_customers(tenant.id, 500)
+    month_start = _dt(now, tz).replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    returning = sum(1 for c in customers if (c["order_count"] or 0) >= 2)
+    new = sum(1 for c in customers if (c["first_seen"] or 0) >= month_start)
+    kpis = f"""<div class="kpis" style="grid-template-columns:repeat(3,minmax(0,1fr))">
+<div class="card kpi"><div class="l">Saved customers</div><div class="v">{len(customers)}</div></div>
+<div class="card kpi"><div class="l">Returning (2+ orders)</div><div class="v">{returning}</div></div>
+<div class="card kpi"><div class="l">New this month</div><div class="v">{new}</div></div></div>"""
+    if customers:
+        rows = "".join(
+            f'<tr data-q="{_e((c["name"] + " " + c["phone"]).lower())}">'
+            f'<td><b>{_e(c["name"]) or "<span class=mut>No name yet</span>"}</b></td>'
+            f'<td class="id">{_e(_phone_display(c["phone"]))}</td>'
+            f'<td>{c["order_count"]}</td>'
+            f'<td>{_e(c["last_order"]) or "<span class=mut>—</span>"}</td>'
+            f'<td class="mut">{_clock(c["last_seen"], tz, "datetime")}</td></tr>'
+            for c in customers)
+        table = (f'<div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Phone</th><th>Orders</th>'
+                 f'<th>Last order</th><th>Last seen</th></tr></thead><tbody>{rows}</tbody></table></div>')
+    else:
+        table = ('<div class="empty">No customers yet. Everyone who places an order by phone or chat '
+                 'is saved here, and the AI greets them by name next time they call.</div>')
+    body = (_page_head("Customers", "Callers your AI remembers: next time they call, it reads back "
+                       "their name and number to confirm.")
+            + kpis + f"""<div style="max-width:430px;margin-bottom:24px;position:relative">
+<span style="position:absolute;left:16px;top:50%;transform:translateY(-50%);color:var(--mut)">{icon("search", 18)}</span>
+<input id="cq" placeholder="Search name or phone…" style="padding-left:46px"></div>
+<div class="card" id="customers">{table}</div>
+<script>(function(){{var q=document.getElementById('cq');
+var rows=[].slice.call(document.querySelectorAll('#customers tbody tr'));
+q.addEventListener('input',function(){{var t=q.value.trim().toLowerCase().replace(/[^a-z0-9 ]/g,'');
+rows.forEach(function(r){{r.style.display=!t||r.dataset.q.replace(/[^a-z0-9 ]/g,'').indexOf(t)>=0?'':'none';}});}});}})();</script>""")
+    return _page(deps, tenant, "customers", "Customers", body)
+
+
+def _phone_display(digits: str) -> str:
+    d = "".join(ch for ch in str(digits or "") if ch.isdigit())
+    return f"({d[:3]}) {d[3:6]}-{d[6:]}" if len(d) == 10 else str(digits or "")
+
+
 def _settings_page(deps: PortalDeps, tenant: Tenant, user: PortalUser | None = None,
                    saved: bool = False) -> str:
     cur_tz = tenant.setting("timezone", "")
@@ -1193,6 +1235,19 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             return res
         _, tenant = res
         return _orders_page(deps, tenant)
+
+    @router.get("/portal/customers", response_class=HTMLResponse)
+    async def customers_page(request: Request):
+        res = page_user(request)
+        if isinstance(res, RedirectResponse):
+            return res
+        _, tenant = res
+        return _customers_page(deps, tenant)
+
+    @router.get("/portal/api/customers")
+    async def api_customers(request: Request, limit: int = 100):
+        _, tenant = api_user(request)
+        return {"customers": deps.tenants.list_customers(tenant.id, max(1, min(limit, 500)))}
 
     @router.get("/portal/settings", response_class=HTMLResponse)
     async def settings_page(request: Request, saved: int = 0):

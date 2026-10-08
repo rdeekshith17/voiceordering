@@ -33,6 +33,7 @@ def test_prompt_knows_first_time_and_returning_callers(catalog, ctx):
     back = build_caller_section({"phone": "+14155550123", "name": "Sam Patel",
                                  "order_count": 3, "last_order": "2 Chicken Taco"})
     assert "Name: Sam Patel" in back and "3 times" in back and "2 Chicken Taco" in back
+    assert '"Sam Patel at 415-555-0123"' in back and "never ask for them again" in back
     assert "RETURNING CALLER" in build_system_prompt(catalog, ctx, {"phone": "1", "name": "Sam"})
 
 
@@ -54,7 +55,8 @@ def test_returning_caller_greeted_by_name(monkeypatch):
     form = {"CallSid": "CAback1", "From": "+1 555 123 0000", "To": tenant.phone_number or "+1"}
     try:
         resp = client.post("/twilio/voice", data=form)
-        assert "Welcome back, Sam." in resp.text
+        assert ("Welcome back! I have you down as Sam Patel at 555-123-0000. "
+                "Is that still correct?") in resp.text
         session = api_main._twilio_sessions["CAback1"]
         assert isinstance(session, AgentSession)
         assert "Name: Sam Patel" in session.system
@@ -73,3 +75,36 @@ def test_order_remembers_customer_by_caller_id_and_spoken_number(cart):
     for number in ("2145550199", "2145550101"):
         saved = api_main.tenant_store.get_customer(tenant.id, number)
         assert saved and saved["name"] == "Ana Ruiz" and saved["order_count"] >= 1
+
+
+def test_spoken_phone_formats_us_numbers_for_the_voice():
+    from voiceorder.agent.prompt import spoken_phone
+
+    assert spoken_phone("+1 (283) 229-8041") == "283-229-8041"
+    assert spoken_phone("+442071234567") == "+442071234567"
+
+
+def test_customers_page_lists_only_this_restaurants_callers(tmp_path):
+    from fastapi import FastAPI
+
+    from voiceorder.api.storage import InMemoryOrderStore
+    from voiceorder.portal.portal import PortalDeps, build_portal_router
+
+    store = TenantStore(tmp_path / "p.db")
+    app = FastAPI()
+    app.include_router(build_portal_router(PortalDeps(
+        tenants=store, order_store=InMemoryOrderStore(),
+        build_adapter=lambda t, o: None, get_catalog=lambda t: None)))
+    client = TestClient(app, follow_redirects=False)
+    assert client.get("/portal/customers").status_code == 302  # login required
+    client.post("/portal/signup", data={"restaurant": "Hyderabad House", "phone": "+15622680097",
+                                        "email": "o@example.com", "password": "password123"})
+    mine = store.get_tenant_by_name("Hyderabad House")
+    other = store.create_tenant("Taco Palace", "+15550001111")
+    store.record_customer(mine.id, "+12832298041", name="Ravula", last_order="1 Vegetable Pakora",
+                          ordered=True)
+    store.record_customer(other.id, "+19998887777", name="Not Mine", ordered=True)
+    page = client.get("/portal/customers").text
+    assert "Ravula" in page and "(283) 229-8041" in page and "1 Vegetable Pakora" in page
+    assert "Not Mine" not in page
+    assert [c["name"] for c in client.get("/portal/api/customers").json()["customers"]] == ["Ravula"]
