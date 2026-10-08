@@ -42,6 +42,7 @@ from pydantic import BaseModel
 
 from ..agent.llm import AnthropicClient, MissingCredentials
 from ..agent.loop import AgentSession
+from ..agent.prompt import returning_name, spoken_phone
 from ..core import tools
 from ..db import describe as describe_db, is_postgres
 from ..core.cart import CartState
@@ -757,12 +758,14 @@ def _caller_profile(tenant: Tenant, caller_number: str) -> dict | None:
 
 
 def _greeting(ctx: RestaurantContext, caller: dict | None) -> str:
-    greeting = adapter.call_start_response(ctx)["greeting"]
-    first = ((caller or {}).get("name") or "").split(" ")[0].strip()
-    if first and first.replace("-", "").replace("'", "").isalpha():
-        greeting = (f"Thanks for calling {ctx.restaurant_name}! Welcome back, {first}. "
-                    "This call may be recorded. What can I get started for you?")
-    return greeting
+    """Standard greeting; a returning caller hears their saved name and number
+    and is asked to confirm them before ordering."""
+    name = returning_name(caller)
+    if not name:
+        return adapter.call_start_response(ctx)["greeting"]
+    return (f"Thanks for calling {ctx.restaurant_name}! This call may be recorded. "
+            f"Welcome back! I have you down as {name} at {spoken_phone(caller['phone'])}. "
+            "Is that still correct?")
 
 
 def _new_twilio_session(tenant: Tenant | None = None,
