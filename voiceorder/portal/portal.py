@@ -13,6 +13,7 @@ import json
 import logging
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from typing import Any, Callable
@@ -22,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from ..tenants import crypto
+from ..tenants import rbac
 from ..tenants.store import PortalUser, Tenant, TenantStore
 from ..voice import tts
 from ..voice import voices as voice_catalog
@@ -137,6 +139,18 @@ _TZ_GUESS_JS = """<script>(function(){try{
   if([].some.call(s.options,function(o){return o.value===z;})){s.value=z;
     var n=document.getElementById('tz-guess'); if(n) n.hidden=false;}
 }catch(e){}})();</script>"""
+
+# Role of the user the current page is rendered for (set by page_user), so the
+# sidebar only shows pages that role may open.
+_viewer_role: ContextVar[str] = ContextVar("viewer_role", default="owner")
+
+# Sidebar key -> permission needed to see it.
+_NAV_PERMISSION = {
+    "dash": "reports.view", "stats": "reports.view", "orders": "orders.view",
+    "customers": "customers.view", "calls": "calls.view", "pos": "pos.edit",
+    "marketing": "reports.view", "usage": "reports.view", "support": "support.use",
+    "settings": "settings.edit",
+}
 
 # A call still marked live after this long without a turn lost its status webhook.
 _LIVE_STALE_SECONDS = 1800
@@ -298,9 +312,11 @@ def _page(deps: PortalDeps, tenant: Tenant, active: str, title: str, body: str) 
     now = time.time()
     live = sum(1 for c in deps.tenants.list_calls(tenant.id, 50) if _is_live(c, now))
     label, connected, _ = _pos_state(deps, tenant)
+    role = _viewer_role.get()
     return ui.shell(
         title=title, body=body, tenant_name=tenant.name, active=active,
         platform=deps.platform_name, live_calls=live,
+        visible={k for k, perm in _NAV_PERMISSION.items() if rbac.can(role, perm)},
         status_label="Live workspace" if connected else "Setup needed",
         status_ok=connected,
     )
@@ -1117,7 +1133,9 @@ def _set_login_cookie(resp: RedirectResponse, user: PortalUser) -> None:
 def build_portal_router(deps: PortalDeps) -> APIRouter:
     router = APIRouter()
 
-    def page_user(request: Request) -> tuple[PortalUser, Tenant] | RedirectResponse:
+    def page_user(request: Request, permission: str) -> tuple[PortalUser, Tenant] | RedirectResponse:
+        """Signed-in user allowed `permission`, else a redirect (login, or the
+        first page their role may open)."""
         user = _session_user(request, deps)
         if not user:
             return RedirectResponse("/portal/login", status_code=302)
@@ -1126,22 +1144,31 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             r = RedirectResponse("/portal/login", status_code=302)
             r.delete_cookie(COOKIE_NAME, path="/")
             return r
+        if not rbac.can(user.role, permission):
+            home = rbac.home_page(user.role)
+            # Never bounce a user back to the page they were refused.
+            return RedirectResponse(home if home != request.url.path else "/portal/logout",
+                                    status_code=302)
+        _viewer_role.set(user.role)
         return user, tenant
 
-    def api_user(request: Request) -> tuple[PortalUser, Tenant]:
+    def api_user(request: Request, permission: str) -> tuple[PortalUser, Tenant]:
         user = _session_user(request, deps)
         if not user:
             raise HTTPException(status_code=401, detail="login required")
         tenant = deps.tenants.get_tenant(user.tenant_id)
         if not tenant:
             raise HTTPException(status_code=401, detail="login required")
+        if not rbac.can(user.role, permission):
+            raise HTTPException(status_code=403, detail="your role can't do that")
         return user, tenant
 
     # -- auth pages ------------------------------------------------------
     @router.get("/portal/login", response_class=HTMLResponse)
     async def login_page(request: Request):
-        if _session_user(request, deps):
-            return RedirectResponse("/portal/", status_code=302)
+        current = _session_user(request, deps)
+        if current:
+            return RedirectResponse(rbac.home_page(current.role), status_code=302)
         return _login_page(deps.platform_name, signup=deps.signup_enabled)
 
     @router.post("/portal/login")
@@ -1156,7 +1183,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
                             signup=deps.signup_enabled),
                 status_code=401,
             )
-        resp = RedirectResponse("/portal/", status_code=302)
+        resp = RedirectResponse(rbac.home_page(user.role), status_code=302)
         _set_login_cookie(resp, user)
         return resp
 
@@ -1200,6 +1227,8 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             return HTMLResponse(_signup_page(deps.platform_name, str(exc)),
                                 status_code=400)
         tenant = deps.tenants.get_tenant(tenant.id)
+        deps.tenants.audit("user", user.id, tenant.id, "account.signup", f"user:{user.id}",
+                           None, {"restaurant": tenant.name, "email": user.email, "role": user.role})
         resp = RedirectResponse("/portal/pos", status_code=302)
         _set_login_cookie(resp, user)
         log.info("portal signup: tenant %s (%s)", tenant.id, tenant.name)
@@ -1214,7 +1243,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
     # -- pages -----------------------------------------------------------
     @router.get("/portal/", response_class=HTMLResponse)
     async def dashboard(request: Request):
-        res = page_user(request)
+        res = page_user(request, "reports.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1222,7 +1251,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/statistics", response_class=HTMLResponse)
     async def statistics_page(request: Request, days: int = 7):
-        res = page_user(request)
+        res = page_user(request, "reports.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1230,7 +1259,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/orders", response_class=HTMLResponse)
     async def orders_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "orders.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1238,7 +1267,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/customers", response_class=HTMLResponse)
     async def customers_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "customers.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1246,12 +1275,12 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/customers")
     async def api_customers(request: Request, limit: int = 100):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "customers.view")
         return {"customers": deps.tenants.list_customers(tenant.id, max(1, min(limit, 500)))}
 
     @router.get("/portal/settings", response_class=HTMLResponse)
     async def settings_page(request: Request, saved: int = 0):
-        res = page_user(request)
+        res = page_user(request, "settings.edit")
         if isinstance(res, RedirectResponse):
             return res
         user, tenant = res
@@ -1259,7 +1288,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/pos", response_class=HTMLResponse)
     async def pos_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "pos.edit")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1267,7 +1296,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/calls", response_class=HTMLResponse)
     async def calls_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "calls.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1275,7 +1304,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/calls/{call_sid}", response_class=HTMLResponse)
     async def call_detail_page(request: Request, call_sid: str):
-        res = page_user(request)
+        res = page_user(request, "calls.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1285,7 +1314,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/support", response_class=HTMLResponse)
     async def support_page(request: Request, sent: int = 0):
-        res = page_user(request)
+        res = page_user(request, "support.use")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1293,7 +1322,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.post("/portal/support/request")
     async def support_request(request: Request):
-        res = page_user(request)
+        res = page_user(request, "support.use")
         if isinstance(res, RedirectResponse):
             return res
         user, tenant = res
@@ -1310,7 +1339,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/marketing", response_class=HTMLResponse)
     async def marketing_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "reports.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1318,7 +1347,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/usage", response_class=HTMLResponse)
     async def usage_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "reports.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1326,7 +1355,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.post("/portal/api/tickets/{ticket_id}/ack")
     async def api_ticket_ack(request: Request, ticket_id: str):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "support.use")
         if not deps.tenants.ack_ticket(tenant.id, ticket_id):
             raise HTTPException(status_code=404, detail="ticket not found")
         return RedirectResponse("/portal/support", status_code=302)
@@ -1334,12 +1363,12 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
     # -- JSON API --------------------------------------------------------
     @router.get("/portal/api/calls")
     async def api_calls(request: Request, limit: int = 30):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "calls.view")
         return {"calls": deps.tenants.list_calls(tenant.id, min(limit, 100))}
 
     @router.get("/portal/api/calls/{call_sid}")
     async def api_call_detail(request: Request, call_sid: str):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "calls.view")
         t = deps.tenants.get_transcript(tenant.id, call_sid)
         if not t:
             raise HTTPException(status_code=404, detail="call not found")
@@ -1347,7 +1376,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/orders")
     async def api_orders(request: Request, limit: int = 30):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "orders.view")
         orders = deps.order_store.list_by_tenant(tenant.id, min(limit, 100))
         return {"orders": [
             {"order_id": o.get("order_id"), "order_number": o.get("order_number"),
@@ -1358,7 +1387,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/orders.csv")
     async def api_orders_csv(request: Request, days: int = 0):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "orders.view")
         stamp = time.strftime("%Y%m%d")
         return Response(
             content=_orders_csv(deps, tenant, max(0, min(days, 3650))),
@@ -1368,17 +1397,17 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/tickets")
     async def api_tickets(request: Request):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "support.use")
         return {"tickets": deps.tenants.list_tickets(tenant.id)}
 
     @router.get("/portal/api/marketing")
     async def api_marketing(request: Request, limit: int = 20):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "reports.view")
         return {"drafts": deps.tenants.list_drafts(tenant.id, min(limit, 100))}
 
     @router.get("/portal/api/usage")
     async def api_usage(request: Request, limit: int = 30):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "reports.view")
         return {"usage": deps.tenants.get_usage(tenant.id, min(limit, 90))}
 
     def _pos_view(tenant: Tenant) -> dict:
@@ -1398,7 +1427,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/pos")
     async def api_pos_get(request: Request):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "pos.edit")
         return _pos_view(tenant)
 
     def _merged_creds(tenant: Tenant, provider: str, values: dict) -> tuple[dict, str]:
@@ -1424,7 +1453,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.post("/portal/api/pos")
     async def api_pos_save(request: Request):
-        _, tenant = api_user(request)
+        user, tenant = api_user(request, "pos.edit")
         body = await request.json()
         provider = str(body.get("provider", ""))
         merged, err = _merged_creds(tenant, provider, body.get("values"))
@@ -1432,13 +1461,16 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             return JSONResponse({"ok": False, "error": err}, status_code=400)
         deps.tenants.set_secret(tenant.id, provider, merged)
         deps.tenants.set_settings(tenant.id, {"pos_profile": provider})
+        # Field names and non-secret values only; redact() masks the secrets.
+        deps.tenants.audit("user", user.id, tenant.id, "pos.credentials_saved", f"pos:{provider}",
+                           {"pos_profile": tenant.setting("pos_profile", "")}, merged)
         deps.on_config_changed(tenant.id)
         log.info("portal: tenant %s saved %s credentials", tenant.id, provider)
         return {"ok": True}
 
     @router.post("/portal/api/pos/test")
     async def api_pos_test(request: Request):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "pos.edit")
         body = await request.json()
         provider = str(body.get("provider", ""))
         merged, err = _merged_creds(tenant, provider, body.get("values"))
@@ -1455,7 +1487,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.post("/portal/api/settings")
     async def api_settings_save(request: Request):
-        _, tenant = api_user(request)
+        user, tenant = api_user(request, "settings.edit")
         body = await request.json()
         allowed = {f["key"] for f in SETTING_FIELDS} | VOICE_SETTING_KEYS | {"timezone"}
         values = {k: str(v).strip() for k, v in body.items() if k in allowed}
@@ -1486,7 +1518,12 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
                 deps.tenants.set_phone_number(tenant.id, values["phone_number"])
             except ValueError as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        before = {k: tenant.settings.get(k, "") for k in values}
         deps.tenants.set_settings(tenant.id, values)
+        changed = {k: v for k, v in values.items() if before.get(k, "") != v}
+        if changed:
+            deps.tenants.audit("user", user.id, tenant.id, "settings.update", "settings",
+                               {k: before[k] for k in changed}, changed)
         deps.on_config_changed(tenant.id)
         return {"ok": True}
 
@@ -1495,7 +1532,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
         """Render a short sample with the selected (not yet saved) voice and
         model so owners can hear it before committing. Session-authenticated;
         rate-limited per user because every preview spends ElevenLabs chars."""
-        user, tenant = api_user(request)
+        user, tenant = api_user(request, "settings.edit")
         now = time.monotonic()
         bucket = _preview_buckets.get(user.id, [])
         bucket = [t for t in bucket if now - t < 3600]

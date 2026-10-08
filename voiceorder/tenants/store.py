@@ -11,7 +11,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import db as dbmod
-from . import crypto
+from ..migrations import run_migrations
+from . import crypto, rbac
 
 
 def normalize_number(number: str) -> str:
@@ -40,6 +41,23 @@ class PortalUser:
     id: str
     tenant_id: str
     email: str
+    role: str = "owner"
+
+
+@dataclass
+class PlatformUser:
+    id: str
+    email: str
+    role: str
+
+
+# Keys whose values never go into the audit log.
+_SECRET_HINTS = ("token", "secret", "password", "key", "blob")
+
+
+def redact(values: dict | None) -> dict:
+    return {k: ("[redacted]" if any(h in k.lower() for h in _SECRET_HINTS) else v)
+            for k, v in (values or {}).items()}
 
 
 class TenantStore:
@@ -154,6 +172,7 @@ class TenantStore:
         except dbmod.Error:
             pass
         conn.commit()
+        run_migrations(conn)
         return conn
 
     # -- tenants -----------------------------------------------------------
@@ -276,10 +295,13 @@ class TenantStore:
             self._conn.commit()
 
     # -- portal users ------------------------------------------------------
-    def create_user(self, tenant_id: str, email: str, password: str) -> PortalUser:
+    def create_user(self, tenant_id: str, email: str, password: str,
+                    role: str = "owner") -> PortalUser:
         email = email.strip().lower()
         if not email or "@" not in email or len(password) < 8:
             raise ValueError("need a valid email and a password of 8+ characters")
+        if role not in rbac.ROLES:
+            raise ValueError(f"unknown role {role!r}")
         uid = uuid.uuid4().hex[:12]
         with self._lock:
             if self._conn.execute(
@@ -287,31 +309,55 @@ class TenantStore:
             ).fetchone():
                 raise ValueError("that email is already registered")
             self._conn.execute(
-                "INSERT INTO tenant_users (id, tenant_id, email, password_hash, created_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (uid, tenant_id, email, crypto.hash_password(password), time.time()),
+                "INSERT INTO tenant_users (id, tenant_id, email, password_hash, created_at, role)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (uid, tenant_id, email, crypto.hash_password(password), time.time(), role),
             )
             self._conn.commit()
-        return PortalUser(id=uid, tenant_id=tenant_id, email=email)
+        return PortalUser(id=uid, tenant_id=tenant_id, email=email, role=role)
 
     def verify_user(self, email: str, password: str) -> PortalUser | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, tenant_id, email, password_hash FROM tenant_users"
+                "SELECT id, tenant_id, email, password_hash, role FROM tenant_users"
                 " WHERE email = ?",
                 (email.strip().lower(),),
             ).fetchone()
         if not row or not crypto.verify_password(password, row[3]):
             return None
-        return PortalUser(id=row[0], tenant_id=row[1], email=row[2])
+        return PortalUser(id=row[0], tenant_id=row[1], email=row[2], role=row[4])
 
     def get_user(self, user_id: str) -> PortalUser | None:
         with self._lock:
             row = self._conn.execute(
-                "SELECT id, tenant_id, email FROM tenant_users WHERE id = ?",
+                "SELECT id, tenant_id, email, role FROM tenant_users WHERE id = ?",
                 (user_id,),
             ).fetchone()
-        return PortalUser(id=row[0], tenant_id=row[1], email=row[2]) if row else None
+        return PortalUser(id=row[0], tenant_id=row[1], email=row[2], role=row[3]) if row else None
+
+    def list_users(self, tenant_id: str) -> list[PortalUser]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT id, tenant_id, email, role FROM tenant_users WHERE tenant_id = ?"
+                " ORDER BY created_at", (tenant_id,),
+            ).fetchall()
+        return [PortalUser(id=r[0], tenant_id=r[1], email=r[2], role=r[3]) for r in rows]
+
+    def set_user_role(self, tenant_id: str, user_id: str, role: str) -> bool:
+        """Tenant-scoped role change. Refuses to remove the restaurant's last owner."""
+        if role not in rbac.ROLES:
+            raise ValueError(f"unknown role {role!r}")
+        users = {u.id: u for u in self.list_users(tenant_id)}
+        if user_id not in users:
+            return False
+        owners = [u for u in users.values() if u.role == "owner"]
+        if role != "owner" and owners == [users[user_id]]:
+            raise ValueError("a restaurant needs at least one owner")
+        with self._lock:
+            self._conn.execute("UPDATE tenant_users SET role = ? WHERE id = ? AND tenant_id = ?",
+                               (role, user_id, tenant_id))
+            self._conn.commit()
+        return True
 
     def count_users(self, tenant_id: str) -> int:
         with self._lock:
@@ -592,6 +638,151 @@ class TenantStore:
                 (tenant_id, since_ts),
             ).fetchone()
         return row[0] if row else 0
+
+    # -- platform users (super admin / support) -----------------------------
+    def create_platform_user(self, email: str, password: str, role: str = "support") -> PlatformUser:
+        email = email.strip().lower()
+        if not email or "@" not in email or len(password) < 12:
+            raise ValueError("need a valid email and a password of 12+ characters")
+        if role not in rbac.PLATFORM_ROLES:
+            raise ValueError(f"unknown platform role {role!r}")
+        uid = uuid.uuid4().hex[:12]
+        with self._lock:
+            if self._conn.execute("SELECT 1 FROM platform_users WHERE email = ?",
+                                  (email,)).fetchone():
+                raise ValueError("that email is already a platform user")
+            self._conn.execute(
+                "INSERT INTO platform_users (id, email, password_hash, role, active, created_at)"
+                " VALUES (?, ?, ?, ?, 1, ?)",
+                (uid, email, crypto.hash_password(password), role, time.time()),
+            )
+            self._conn.commit()
+        return PlatformUser(id=uid, email=email, role=role)
+
+    def verify_platform_user(self, email: str, password: str) -> PlatformUser | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, email, password_hash, role FROM platform_users"
+                " WHERE email = ? AND active = 1", (email.strip().lower(),),
+            ).fetchone()
+        if not row or not crypto.verify_password(password, row[2]):
+            return None
+        return PlatformUser(id=row[0], email=row[1], role=row[3])
+
+    def get_platform_user(self, user_id: str) -> PlatformUser | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, email, role FROM platform_users WHERE id = ? AND active = 1",
+                (user_id,),
+            ).fetchone()
+        return PlatformUser(id=row[0], email=row[1], role=row[2]) if row else None
+
+    # -- feature flags (default OFF) ----------------------------------------
+    def flag_enabled(self, tenant_id: str, flag: str) -> bool:
+        """On only if switched on for the tenant and not killed platform-wide
+        (env DISABLED_FEATURES, or a disabled '*' row)."""
+        if flag not in rbac.KNOWN_FLAGS or rbac.env_killed(flag):
+            return False
+        with self._lock:
+            rows = dict(self._conn.execute(
+                "SELECT tenant_id, enabled FROM tenant_feature_flags"
+                " WHERE flag = ? AND tenant_id IN (?, '*')", (flag, tenant_id),
+            ).fetchall())
+        if "*" in rows and not rows["*"]:
+            return False
+        return bool(rows.get(tenant_id, 0))
+
+    def set_flag(self, tenant_id: str, flag: str, enabled: bool, actor: str = "") -> None:
+        """tenant_id '*' sets the platform-wide switch for the flag."""
+        if flag not in rbac.KNOWN_FLAGS:
+            raise ValueError(f"unknown feature flag {flag!r}")
+        before = self.list_flags(tenant_id).get(flag, False)
+        with self._lock:
+            self._conn.upsert("tenant_feature_flags",
+                              {"tenant_id": tenant_id, "flag": flag, "enabled": 1 if enabled else 0,
+                               "updated_at": time.time(), "updated_by": actor},
+                              key=("tenant_id", "flag"))
+            self._conn.commit()
+        self.audit("user", actor, None if tenant_id == "*" else tenant_id, "flag.set",
+                   f"flag:{flag}", {"enabled": before}, {"enabled": bool(enabled)})
+
+    def list_flags(self, tenant_id: str) -> dict[str, bool]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT flag, enabled FROM tenant_feature_flags WHERE tenant_id = ?",
+                (tenant_id,),
+            ).fetchall()
+        saved = {r[0]: bool(r[1]) for r in rows}
+        return {f: saved.get(f, False) for f in rbac.KNOWN_FLAGS}
+
+    # -- audit log (append-only, secrets redacted) --------------------------
+    def audit(self, actor_type: str, actor_id: str, tenant_id: str | None, action: str,
+              resource: str = "", before: dict | None = None, after: dict | None = None,
+              now: float | None = None) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO audit_logs (id, at, actor_type, actor_id, tenant_id, action,"
+                " resource, before_json, after_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (uuid.uuid4().hex, now if now is not None else time.time(), actor_type,
+                 actor_id or "", tenant_id, action, resource,
+                 json.dumps(redact(before)), json.dumps(redact(after))),
+            )
+            self._conn.commit()
+
+    def list_audit(self, tenant_id: str | None = None, limit: int = 100) -> list[dict]:
+        """A tenant's events, or every event when tenant_id is None (platform view)."""
+        q = ("SELECT at, actor_type, actor_id, tenant_id, action, resource, before_json,"
+             " after_json FROM audit_logs")
+        params: list = []
+        if tenant_id is not None:
+            q += " WHERE tenant_id = ?"
+            params.append(tenant_id)
+        q += " ORDER BY at DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(q, params).fetchall()
+        return [{"at": r[0], "actor_type": r[1], "actor_id": r[2], "tenant_id": r[3],
+                 "action": r[4], "resource": r[5], "before": json.loads(r[6]),
+                 "after": json.loads(r[7])} for r in rows]
+
+    # -- background job leases ------------------------------------------------
+    def try_start_job(self, job: str, lease_seconds: float, min_interval: float,
+                      now: float | None = None) -> bool:
+        """Claim a job if it is due and nobody holds its lease. Atomic, so two
+        app instances never run the same job at once."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            try:  # first sight of this job; another instance may race us to it
+                self._conn.execute(
+                    "INSERT INTO job_runs (job) SELECT ? WHERE NOT EXISTS"
+                    " (SELECT 1 FROM job_runs WHERE job = ?)", (job, job))
+            except dbmod.Error:
+                pass
+            cur = self._conn.execute(
+                "UPDATE job_runs SET lease_until = ?, last_started_at = ?"
+                " WHERE job = ? AND lease_until < ?"
+                " AND (last_finished_at = 0 OR last_finished_at <= ?)",
+                (now + lease_seconds, now, job, now, now - min_interval),
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def finish_job(self, job: str, status: str, detail: str = "",
+                   now: float | None = None) -> None:
+        now = now if now is not None else time.time()
+        with self._lock:
+            self._conn.execute(
+                "UPDATE job_runs SET lease_until = 0, last_finished_at = ?, last_status = ?,"
+                " last_detail = ? WHERE job = ?", (now, status, detail[:500], job))
+            self._conn.commit()
+
+    def job_status(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT job, last_started_at, last_finished_at, last_status, last_detail"
+                " FROM job_runs ORDER BY job").fetchall()
+        return [{"job": r[0], "last_started_at": r[1], "last_finished_at": r[2],
+                 "last_status": r[3], "last_detail": r[4]} for r in rows]
 
     # -- customers (returning-caller memory) -------------------------------
     def get_customer(self, tenant_id: str, phone: str) -> dict | None:

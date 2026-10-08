@@ -317,6 +317,8 @@ def _seed_default_tenant() -> Tenant:
             creds = _env_pos_creds(provider)
             if creds:
                 tenant_store.set_secret(tenant.id, provider, creds)
+                tenant_store.audit("system", "startup", tenant.id, "pos.credentials_from_env",
+                                   f"pos:{provider}", None, creds)
                 log.info("tenancy: migrated %s credentials for default tenant", provider)
     moved = tenant_store.backfill_orders_tenant(tenant.id)
     if moved:

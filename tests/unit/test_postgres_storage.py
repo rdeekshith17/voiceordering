@@ -19,7 +19,9 @@ URL = os.environ.get("TEST_DATABASE_URL", "")
 pytestmark = pytest.mark.skipif(not URL, reason="TEST_DATABASE_URL not set")
 
 _TABLES = ["carts", "orders", "tenants", "tenant_settings", "tenant_secrets",
-           "tenant_users", "call_transcripts", "tickets", "marketing_drafts", "usage_daily"]
+           "tenant_users", "call_transcripts", "tickets", "marketing_drafts", "usage_daily",
+           "customers", "schema_migrations", "platform_users", "tenant_feature_flags",
+           "audit_logs", "job_runs"]
 
 
 @pytest.fixture(autouse=True)
@@ -110,3 +112,27 @@ def test_percent_signs_and_quotes_in_values():
     tenants.set_settings(t.id, {"note": "50% off; it's '?' time"})
     assert tenants.get_settings(t.id)["note"] == "50% off; it's '?' time"
     assert tenants.get_tenant_by_name("100% tacos").id == t.id
+
+
+def test_migrations_roles_flags_audit_and_leases_on_postgres():
+    from voiceorder.migrations import MIGRATIONS, applied_versions, run_migrations
+
+    _, _, tenants = _stores()
+    assert applied_versions(tenants._conn) == {v for v, _ in MIGRATIONS}
+    assert run_migrations(tenants._conn) == []
+    t = tenants.create_tenant("Hyderabad House")
+    cook = tenants.create_user(t.id, "cook@example.com", "password123", role="kitchen")
+    assert tenants.verify_user("cook@example.com", "password123").role == "kitchen"
+    assert tenants.flag_enabled(t.id, "hitl_enabled") is False
+    tenants.set_flag(t.id, "hitl_enabled", True, actor=cook.id)
+    assert tenants.flag_enabled(t.id, "hitl_enabled") is True
+    tenants.set_flag("*", "hitl_enabled", False, actor="ops")
+    assert tenants.flag_enabled(t.id, "hitl_enabled") is False
+    tenants.audit("user", cook.id, t.id, "pos.credentials_saved", "pos:square",
+                  None, {"access_token": "secret", "location_id": "L1"})
+    saved = [e for e in tenants.list_audit(t.id) if e["action"] == "pos.credentials_saved"][0]
+    assert saved["after"] == {"access_token": "[redacted]", "location_id": "L1"}
+    assert tenants.try_start_job("billing", 600, 3600, now=1000)
+    assert not tenants.try_start_job("billing", 600, 3600, now=1001)
+    _, _, second_instance = _stores()  # another app instance sees the same lease
+    assert not second_instance.try_start_job("billing", 600, 3600, now=1002)

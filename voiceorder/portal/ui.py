@@ -350,18 +350,21 @@ _SHELL_JS = """
 
 def shell(*, title: str, body: str, tenant_name: str, active: str, platform: str,
           live_calls: int = 0, status_label: str = "", status_ok: bool = True,
-          location: str = "Primary location") -> str:
+          location: str = "Primary location", visible: set[str] | None = None) -> str:
     """Signed-in page: dark sidebar + white top bar + light content area."""
     groups = []
     for heading, links in NAV:
         items = []
         for key, label, href, ic in links:
+            if visible is not None and key not in visible:
+                continue
             count = (f'<span class="count">{live_calls}</span>'
                      if key == "calls" and live_calls else "")
             items.append(
                 f'<a class="nav-a{" on" if key == active else ""}" href="{href}" title="{label}">'
                 f'{icon(ic)}<span class="lbl">{label}</span>{count}</a>')
-        groups.append(f'<div class="nav-h">{heading}</div>{"".join(items)}')
+        if items:
+            groups.append(f'<div class="nav-h">{heading}</div>{"".join(items)}')
     tname = html.escape(tenant_name)
     av = initials(tenant_name)
     badge = (f'<span class="badge{"" if status_ok else " warn"}">{html.escape(status_label)}</span>'
