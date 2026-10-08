@@ -11,8 +11,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .. import db as dbmod
+from .. import routing
 from ..migrations import run_migrations
 from . import crypto, rbac
+
+
+# The code's built-in transfer default: a 555 placeholder, never a real line.
+PLACEHOLDER_TRANSFER = "+15550134200"
+
+
+def real_transfer_number(number: str) -> str:
+    """The number to forward calls to, or "" when it's missing or the placeholder."""
+    digits = normalize_number(number)
+    return number if len(digits) >= 10 and digits != normalize_number(PLACEHOLDER_TRANSFER) else ""
 
 
 def normalize_number(number: str) -> str:
@@ -429,7 +440,7 @@ class TenantStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT call_sid, tenant_id, from_number, to_number, status, turns,"
-                " started_at, updated_at FROM call_transcripts"
+                " started_at, updated_at, meta FROM call_transcripts"
                 " WHERE call_sid = ? AND tenant_id = ?",
                 (call_sid, tenant_id),
             ).fetchone()
@@ -438,14 +449,14 @@ class TenantStore:
         return {
             "call_sid": row[0], "tenant_id": row[1], "from_number": row[2],
             "to_number": row[3], "status": row[4], "turns": json.loads(row[5]),
-            "started_at": row[6], "updated_at": row[7],
+            "started_at": row[6], "updated_at": row[7], "meta": json.loads(row[8] or "{}"),
         }
 
     def list_calls(self, tenant_id: str, limit: int = 30) -> list[dict]:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT call_sid, from_number, to_number, status, turns,"
-                " started_at, updated_at FROM call_transcripts"
+                " started_at, updated_at, meta FROM call_transcripts"
                 " WHERE tenant_id = ?"
                 " ORDER BY CASE status WHEN 'live' THEN 0 ELSE 1 END, updated_at DESC"
                 " LIMIT ?",
@@ -458,7 +469,7 @@ class TenantStore:
                 "call_sid": r[0], "from_number": r[1], "to_number": r[2],
                 "status": r[3], "turn_count": len(turns),
                 "last_reply": turns[-1]["reply"][:120] if turns else "",
-                "started_at": r[5], "updated_at": r[6],
+                "started_at": r[5], "updated_at": r[6], "meta": json.loads(r[7] or "{}"),
             })
         return out
 
@@ -784,6 +795,139 @@ class TenantStore:
                 " FROM job_runs ORDER BY job").fetchall()
         return [{"job": r[0], "last_started_at": r[1], "last_finished_at": r[2],
                  "last_status": r[3], "last_detail": r[4]} for r in rows]
+
+    # -- AI answering policy (on/off, schedule, pauses) -------------------------
+    def routing_config(self, tenant_id: str, now: float | None = None) -> tuple[routing.RoutingConfig, int]:
+        """The restaurant's policy and its version (0 = never saved, defaults).
+        Overrides that ended more than a day ago are left out."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT mode, off_action, no_answer_action, closed_message, emergency_off, version"
+                " FROM voice_routing WHERE tenant_id = ?", (tenant_id,)).fetchone()
+            wins = self._conn.execute(
+                "SELECT day, start_min, end_min FROM voice_routing_windows WHERE tenant_id = ?"
+                " ORDER BY day, start_min", (tenant_id,)).fetchall()
+            ovs = self._conn.execute(
+                "SELECT id, starts_at, ends_at, ai_on, kind, reason, created_at"
+                " FROM voice_routing_overrides WHERE tenant_id = ? AND cancelled_at IS NULL"
+                " AND (ends_at IS NULL OR ends_at > ?) ORDER BY starts_at",
+                (tenant_id, now - 86400)).fetchall()
+        cfg = routing.RoutingConfig(
+            windows=[routing.Window(int(d), int(a), int(b)) for d, a, b in wins],
+            overrides=[routing.Override(o[0], o[1], o[2], bool(o[3]), o[4], o[5], o[6]) for o in ovs])
+        if not row:
+            return cfg, 0
+        cfg.mode, cfg.off_action, cfg.no_answer_action, cfg.closed_message = row[0], row[1], row[2], row[3]
+        cfg.emergency_off = bool(row[4])
+        return cfg, int(row[5])
+
+    def save_routing(self, tenant_id: str, cfg: routing.RoutingConfig, actor: str,
+                     expected_version: int | None = None) -> int:
+        """Replace mode, actions, message and weekly windows. Returns the new
+        version; raises ValueError if someone saved in between (stale page)."""
+        if cfg.mode not in routing.MODES or cfg.off_action not in routing.OFF_ACTIONS \
+                or cfg.no_answer_action not in routing.NO_ANSWER_ACTIONS:
+            raise ValueError("unknown mode or action")
+        for w in cfg.windows:
+            if not (0 <= w.day <= 6 and 0 <= w.start_min < 1440 and 0 <= w.end_min < 1440):
+                raise ValueError("schedule times must be within the day")
+        before, version = self.routing_config(tenant_id)
+        if expected_version is not None and expected_version != version:
+            raise ValueError("these settings were changed by someone else; reload and try again")
+        with self._lock, self._conn.transaction():  # callers never see a half-saved schedule
+            self._conn.upsert("voice_routing", {
+                "tenant_id": tenant_id, "mode": cfg.mode, "off_action": cfg.off_action,
+                "no_answer_action": cfg.no_answer_action,
+                "closed_message": cfg.closed_message.strip()[:500],
+                "emergency_off": 1 if before.emergency_off else 0, "version": version + 1,
+                "updated_at": time.time(), "updated_by": actor}, key=("tenant_id",))
+            self._conn.execute("DELETE FROM voice_routing_windows WHERE tenant_id = ?", (tenant_id,))
+            for w in sorted(set(cfg.windows), key=lambda w: (w.day, w.start_min)):
+                self._conn.execute(
+                    "INSERT INTO voice_routing_windows (tenant_id, day, start_min, end_min)"
+                    " VALUES (?, ?, ?, ?)", (tenant_id, w.day, w.start_min, w.end_min))
+
+        def summary(c: routing.RoutingConfig) -> dict:
+            return {"mode": c.mode, "off_action": c.off_action,
+                    "no_answer_action": c.no_answer_action, "closed_message": c.closed_message,
+                    "windows": [[w.day, w.start_min, w.end_min] for w in c.windows]}
+        self.audit("user", actor, tenant_id, "voice_routing.update", "voice_routing",
+                   summary(before), summary(cfg))
+        return version + 1
+
+    def set_routing_emergency(self, tenant_id: str, off: bool, actor: str) -> None:
+        """Turn the AI off now (until resumed). tenant_id '*' = platform-wide stop."""
+        cfg, version = self.routing_config(tenant_id)
+        with self._lock:
+            self._conn.upsert("voice_routing", {
+                "tenant_id": tenant_id, "mode": cfg.mode, "off_action": cfg.off_action,
+                "no_answer_action": cfg.no_answer_action, "closed_message": cfg.closed_message,
+                "emergency_off": 1 if off else 0, "version": version + 1,
+                "updated_at": time.time(), "updated_by": actor}, key=("tenant_id",))
+            self._conn.commit()
+        self.audit("user", actor, None if tenant_id == "*" else tenant_id,
+                   "voice_routing.emergency_off" if off else "voice_routing.emergency_cleared",
+                   "voice_routing", {"emergency_off": cfg.emergency_off}, {"emergency_off": off})
+
+    def platform_emergency(self) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT emergency_off FROM voice_routing WHERE tenant_id = '*'").fetchone()
+        return bool(row and row[0])
+
+    def add_routing_override(self, tenant_id: str, starts_at: float, ends_at: float | None,
+                             ai_on: bool, kind: str, reason: str, actor: str) -> str:
+        if kind not in ("pause", "exception"):
+            raise ValueError("unknown override kind")
+        if ends_at is not None and ends_at <= starts_at:
+            raise ValueError("the end must be after the start")
+        oid = uuid.uuid4().hex[:12]
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO voice_routing_overrides (id, tenant_id, starts_at, ends_at, ai_on,"
+                " kind, reason, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (oid, tenant_id, starts_at, ends_at, 1 if ai_on else 0, kind,
+                 reason.strip()[:120], actor, time.time()))
+            self._conn.commit()
+        self.audit("user", actor, tenant_id, f"voice_routing.{kind}_added", f"override:{oid}", None,
+                   {"starts_at": starts_at, "ends_at": ends_at, "ai_on": ai_on, "reason": reason})
+        return oid
+
+    def cancel_routing_overrides(self, tenant_id: str, actor: str, override_id: str | None = None,
+                                 kind: str | None = None, now: float | None = None) -> int:
+        """Cancel one override (by id) or all current ones of a kind. Tenant-scoped."""
+        now = now if now is not None else time.time()
+        q = ("UPDATE voice_routing_overrides SET cancelled_at = ? WHERE tenant_id = ?"
+             " AND cancelled_at IS NULL")
+        params: list = [now, tenant_id]
+        if override_id:
+            q += " AND id = ?"
+            params.append(override_id)
+        if kind:
+            q += " AND kind = ? AND starts_at <= ? AND (ends_at IS NULL OR ends_at > ?)"
+            params += [kind, now, now]
+        with self._lock:
+            n = self._conn.execute(q, params).rowcount
+            self._conn.commit()
+        if n:
+            self.audit("user", actor, tenant_id, "voice_routing.override_cancelled",
+                       f"override:{override_id or kind}", None, {"cancelled": n})
+        return n
+
+    # -- per-call routing record -------------------------------------------------
+    def set_call_meta(self, call_sid: str, **values) -> None:
+        """Merge values into the call's meta JSON (routing outcome, voicemail link)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT meta FROM call_transcripts WHERE call_sid = ?", (call_sid,)).fetchone()
+            if not row:
+                return
+            meta = json.loads(row[0] or "{}")
+            meta.update(values)
+            self._conn.execute("UPDATE call_transcripts SET meta = ?, updated_at = ?"
+                               " WHERE call_sid = ?", (json.dumps(meta), time.time(), call_sid))
+            self._conn.commit()
 
     # -- customers (returning-caller memory) -------------------------------
     def get_customer(self, tenant_id: str, phone: str) -> dict | None:

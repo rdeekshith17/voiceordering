@@ -23,8 +23,9 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from ..tenants import crypto
+from .. import routing
 from ..tenants import rbac
-from ..tenants.store import PortalUser, Tenant, TenantStore
+from ..tenants.store import PortalUser, Tenant, TenantStore, normalize_number, real_transfer_number
 from ..voice import tts
 from ..voice import voices as voice_catalog
 from ..voice.tts import TtsError
@@ -149,7 +150,7 @@ _NAV_PERMISSION = {
     "dash": "reports.view", "stats": "reports.view", "orders": "orders.view",
     "customers": "customers.view", "calls": "calls.view", "pos": "pos.edit",
     "marketing": "reports.view", "usage": "reports.view", "support": "support.use",
-    "settings": "settings.edit",
+    "settings": "settings.edit", "phone": "settings.edit",
 }
 
 # A call still marked live after this long without a turn lost its status webhook.
@@ -604,6 +605,226 @@ def _orders_page(deps: PortalDeps, tenant: Tenant) -> str:
     return _page(deps, tenant, "orders", "Orders", body)
 
 
+# --- AI phone answering (PR 2) ------------------------------------------------------
+_OFF_ACTION_LABELS = {"transfer": "Forward to staff", "voicemail": "Take a voicemail",
+                      "message": "Play a closed message"}
+_NO_ANSWER_LABELS = {"voicemail": "Take a voicemail", "message": "Play the closed message"}
+
+
+def _hhmm(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def _parse_hhmm(text: str) -> int:
+    h, _, m = str(text).partition(":")
+    value = int(h) * 60 + int(m)
+    if not 0 <= value < 1440:
+        raise ValueError
+    return value
+
+
+def _routing_view(deps: PortalDeps, tenant: Tenant) -> dict:
+    """Everything the AI phone page shows, incl. what happens to a call right now."""
+    tz, now = _tz(tenant), time.time()
+    enabled = deps.tenants.flag_enabled(tenant.id, "voice_schedule_enabled")
+    cfg, version = deps.tenants.routing_config(tenant.id, now)
+    decision = (routing.evaluate(cfg, now, tz, deps.tenants.platform_emergency()) if enabled
+                else routing.Decision(True, "AI phone controls are off: the AI answers every call"))
+    real_transfer = real_transfer_number(tenant.setting("transfer_number", ""))
+    return {
+        "enabled": enabled, "version": version, "mode": cfg.mode,
+        "off_action": cfg.off_action, "no_answer_action": cfg.no_answer_action,
+        "closed_message": cfg.closed_message, "emergency_off": cfg.emergency_off,
+        "windows": [{"day": w.day, "start": _hhmm(w.start_min), "end": _hhmm(w.end_min)}
+                    for w in cfg.windows],
+        "overrides": [{"id": o.id, "kind": o.kind, "ai_on": o.ai_on, "reason": o.reason,
+                       "starts_at": o.starts_at, "ends_at": o.ends_at,
+                       "active": o.starts_at <= now and (o.ends_at is None or now < o.ends_at)}
+                      for o in cfg.overrides if o.ends_at is None or o.ends_at > now],
+        "effective": {"ai": decision.ai, "reason": decision.reason,
+                      "next_change_at": decision.next_change_at},
+        "transfer_number": real_transfer, "timezone": tenant.setting("timezone", ""),
+    }
+
+
+_PHONE_JS = r"""
+const DATA = __DATA__;
+const DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+const $ = s => document.querySelector(s);
+function msg(kind, text){ const m=$('#phone-msg'); m.innerHTML='<div class="alert '+kind+'"></div>'; m.firstChild.textContent=text; m.scrollIntoView({block:'nearest'}); }
+async function call(url, method, body){
+  const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body: body?JSON.stringify(body):undefined});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok || j.ok===false){ msg('bad', j.error || j.detail || ('Failed ('+r.status+')')); return null; }
+  return j;
+}
+function winRow(day, w){
+  const row=document.createElement('div'); row.className='win';
+  row.innerHTML='<input type="time" class="ws" required> <span class="mut">to</span> <input type="time" class="we" required>'+
+    '<span class="mut small over" hidden>(ends next day)</span><button type="button" class="linkbtn rm">Remove</button>';
+  row.querySelector('.ws').value=w.start; row.querySelector('.we').value=w.end;
+  const upd=()=>{ row.querySelector('.over').hidden=!(row.querySelector('.we').value<=row.querySelector('.ws').value); };
+  row.querySelectorAll('input').forEach(i=>i.addEventListener('input',upd)); upd();
+  row.querySelector('.rm').onclick=()=>row.remove();
+  return row;
+}
+function renderSchedule(){
+  const g=$('#sched'); g.innerHTML='';
+  DAYS.forEach((name,day)=>{
+    const d=document.createElement('div'); d.className='day'; d.textContent=name;
+    const box=document.createElement('div'); box.className='wins'; box.dataset.day=day;
+    DATA.windows.filter(w=>w.day===day).forEach(w=>box.appendChild(winRow(day,w)));
+    const add=document.createElement('button'); add.type='button'; add.className='linkbtn'; add.textContent='+ Add hours';
+    add.onclick=()=>box.insertBefore(winRow(day,{start:'11:00',end:'21:00'}), add);
+    box.appendChild(add); g.append(d, box);
+  });
+}
+function collectWindows(){
+  const out=[];
+  document.querySelectorAll('#sched .wins').forEach(box=>box.querySelectorAll('.win').forEach(r=>{
+    out.push({day:+box.dataset.day, start:r.querySelector('.ws').value, end:r.querySelector('.we').value});
+  }));
+  return out;
+}
+function syncVisibility(){
+  const mode=document.querySelector('input[name=mode]:checked').value;
+  $('#sched-card').hidden = mode!=='scheduled';
+  const off=$('#off_action').value;
+  $('#no-answer-row').hidden = off!=='transfer';
+  $('#controls').classList.toggle('dim', !$('#enabled').checked);
+}
+$('#copy-mon').onclick=()=>{
+  const mon=[...document.querySelectorAll('#sched .wins[data-day="0"] .win')].map(r=>({start:r.querySelector('.ws').value,end:r.querySelector('.we').value}));
+  DATA.windows=[]; for(let d=0;d<7;d++) mon.forEach(w=>DATA.windows.push({day:d,...w})); renderSchedule();
+};
+document.querySelectorAll('input[name=mode], #off_action, #enabled').forEach(e=>e.addEventListener('change',syncVisibility));
+$('#routing-form').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const body={enabled:$('#enabled').checked, mode:document.querySelector('input[name=mode]:checked').value,
+    off_action:$('#off_action').value, no_answer_action:$('#no_answer_action').value,
+    closed_message:$('#closed_message').value, windows:collectWindows(), expected_version:DATA.version};
+  if(body.enabled && body.mode==='scheduled' && !body.windows.length){ msg('bad','Add at least one time window, or choose Always on.'); return; }
+  if(await call('/portal/api/voice-routing','PUT',body)) location.href='/portal/phone?saved=1';
+});
+document.querySelectorAll('[data-pause]').forEach(b=>b.onclick=async()=>{
+  if(await call('/portal/api/voice-routing/pause','POST',{until:b.dataset.pause})) location.reload();
+});
+const resume=$('#resume'); if(resume) resume.onclick=async()=>{ if(await call('/portal/api/voice-routing/resume','POST',{})) location.reload(); };
+const stop=$('#stop'); if(stop) stop.onclick=async()=>{
+  if(confirm('Turn the AI off now? New calls follow your "when the AI is off" choice until you resume.') &&
+     await call('/portal/api/voice-routing/stop','POST',{})) location.reload();
+};
+$('#exc-form').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const body={from:$('#exc-from').value, to:$('#exc-to').value||$('#exc-from').value,
+              ai_on:$('#exc-ai').value==='on', reason:$('#exc-reason').value};
+  if(await call('/portal/api/voice-routing/exceptions','POST',body)) location.reload();
+});
+document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=async()=>{
+  if(await call('/portal/api/voice-routing/exceptions/'+encodeURIComponent(b.dataset.cancel),'DELETE')) location.reload();
+});
+renderSchedule(); syncVisibility();
+"""
+
+
+def _phone_page(deps: PortalDeps, tenant: Tenant, saved: bool = False) -> str:
+    tz = _tz(tenant)
+    v = _routing_view(deps, tenant)
+    eff = v["effective"]
+    nxt = ""
+    if v["enabled"] and eff["next_change_at"]:
+        nxt = (f"Next change: AI {'off' if eff['ai'] else 'on'} at "
+               f"{_clock(eff['next_change_at'], tz, 'datetime')}.")
+    if not v["enabled"]:
+        state = "AI answers every call"
+    elif eff["ai"]:
+        state = "AI is answering calls"
+    else:
+        state = {"transfer": "AI is off: calls are forwarded to staff",
+                 "voicemail": "AI is off: callers can leave a voicemail",
+                 "message": "AI is off: callers hear your closed message"}[v["off_action"]]
+    paused = v["emergency_off"] or any(o["active"] and o["kind"] == "pause" for o in v["overrides"])
+    buttons = ""
+    if v["enabled"]:
+        if paused:
+            buttons = f'<button class="btn" id="resume" type="button">{icon("play", 16)}Resume AI</button>'
+        else:
+            buttons = ('<button class="btn ghost sm" type="button" data-pause="1h">Pause 1 hour</button>'
+                       '<button class="btn ghost sm" type="button" data-pause="midnight">Pause until midnight</button>'
+                       '<button class="btn ghost sm" type="button" data-pause="resume">Pause until I resume</button>'
+                       '<button class="btn ghost sm" type="button" id="stop" style="color:var(--bad)">Turn AI off now</button>')
+    status = f"""<div class="card kpi {'ok' if eff['ai'] else 'warn'}" style="min-height:0;margin-bottom:32px">
+<div class="state"><span class="dot {'' if eff['ai'] else 'warn'}"></span><span class="big">{_e(state)}</span></div>
+<p style="margin:10px 0 0">{_e(eff['reason'])}. {nxt}</p>
+{f'<div class="actions" style="margin-top:20px">{buttons}</div>' if buttons else ''}</div>"""
+
+    if v["transfer_number"]:
+        transfer_note = f"Forwards to <b>{_e(_phone_display(normalize_number(v['transfer_number'])))}</b>, rings for 20 seconds."
+    else:
+        transfer_note = ("<span class='amber'>No staff number set yet</span>, so forwarded calls go straight to "
+                         "the fallback below. <a href='/portal/settings'>Set the transfer number</a>.")
+    mode_opts = "".join(
+        f'<label><input type="radio" name="mode" value="{m}"{" checked" if v["mode"] == m else ""}>{l}</label>'
+        for m, l in (("always_on", "Always on"), ("scheduled", "On a schedule"), ("always_off", "Always off")))
+    off_opts = "".join(f'<option value="{k}"{" selected" if v["off_action"] == k else ""}>{l}</option>'
+                       for k, l in _OFF_ACTION_LABELS.items())
+    na_opts = "".join(f'<option value="{k}"{" selected" if v["no_answer_action"] == k else ""}>{l}</option>'
+                      for k, l in _NO_ANSWER_LABELS.items())
+    def when(o: dict) -> str:
+        if o["kind"] == "exception" and o["ends_at"]:  # whole local days
+            first = _dt(o["starts_at"], tz).strftime("%b %d")
+            last = _dt(o["ends_at"] - 1, tz).strftime("%b %d")
+            return first if first == last else f"{first} – {last}"
+        end = _clock(o["ends_at"], tz, "datetime") if o["ends_at"] else "until resumed"
+        return f"{_clock(o['starts_at'], tz, 'datetime')} → {end}"
+    exc_rows = "".join(
+        f"<div class='rank' style='align-items:center;padding:16px 0'><div><b>{when(o)}</b>"
+        f"<div class='mut small'>{_e(o['reason']) or ('Pause' if o['kind'] == 'pause' else 'Exception')}</div></div>"
+        f"<div style='display:flex;gap:14px;align-items:center'>"
+        f"<span class='pill {'ok' if o['ai_on'] else 'warn'}'>AI {'on' if o['ai_on'] else 'off'}</span>"
+        f"<button class='linkbtn rm' type='button' data-cancel='{_e(o['id'])}'>Cancel</button></div></div>"
+        for o in v["overrides"])
+    zone = dict(TIMEZONES).get(v["timezone"], "the server's clock (set a time zone in System settings)")
+    body = _page_head("AI phone answering",
+                      "Choose when the AI answers your calls, and what callers get when it doesn't.") + f"""
+{'<div class="alert ok">Saved.</div>' if saved else ''}<div id=phone-msg></div>{status}
+<div class="grid-main" style="align-items:start"><form id="routing-form" class="stack" style="gap:28px">
+<label class="switch"><input type="checkbox" id="enabled"{' checked' if v['enabled'] else ''}>
+Use AI phone controls <span class="mut small" style="font-weight:400">(off = the AI answers every call, as before)</span></label>
+<div id="controls" class="stack" style="gap:28px">
+<div><h3 class="sec-h" style="margin-bottom:10px">When should the AI answer?</h3>
+<div class="choice">{mode_opts}</div></div>
+<div class="card" id="sched-card"><div class="card-h"><h3>Weekly schedule</h3>
+<span class="r mut small">Times in {_e(zone)}</span></div>
+<div class="card-b"><div class="sched" id="sched"></div>
+<button class="btn ghost sm" type="button" id="copy-mon" style="margin-top:18px">Copy Monday to every day</button></div></div>
+<div><h3 class="sec-h" style="margin-bottom:10px">When the AI is off</h3>
+<select id="off_action">{off_opts}</select><p class="help">{transfer_note}</p>
+<div id="no-answer-row"><label class="f">If staff don't answer or the line is busy</label>
+<select id="no_answer_action">{na_opts}</select></div>
+<label class="f">Closed message</label>
+<textarea id="closed_message" maxlength="500" style="min-height:90px"
+ placeholder="Thanks for calling {_e(tenant.name)}. We can't take your call right now. Please call back during our opening hours.">{_e(v['closed_message'])}</textarea>
+</div></div>
+<div class="actions" style="margin-top:0"><button class="btn" type="submit">{icon("save", 18)}Save</button></div>
+</form>
+<div><h3 class="sec-h">Holidays &amp; exceptions</h3>
+<p class="mut small" style="margin-top:-10px">Override the schedule for whole days, e.g. AI off on a holiday.</p>
+<div class="card"><div class="card-b" style="padding-top:4px;padding-bottom:4px">{exc_rows or '<p class="mut">No upcoming exceptions.</p>'}</div></div>
+<form id="exc-form" class="card card-b" style="margin-top:20px">
+<h3 class="sec-h" style="margin-bottom:6px;font-size:17px">Add an exception</h3>
+<label class="f" style="margin-top:12px">From</label><input type="date" id="exc-from" required>
+<label class="f" style="margin-top:12px">To <span class="mut small">(optional)</span></label><input type="date" id="exc-to">
+<label class="f" style="margin-top:12px">AI</label>
+<select id="exc-ai"><option value="off">Off all day</option><option value="on">On all day</option></select>
+<input id="exc-reason" maxlength="120" placeholder="Reason, e.g. Thanksgiving" style="margin-top:12px">
+<div class="actions" style="margin-top:16px"><button class="btn ghost" type="submit">Add exception</button></div></form>
+</div></div>
+<style>#controls.dim{{opacity:.45;pointer-events:none}}</style>
+<script>{_PHONE_JS.replace("__DATA__", json.dumps(v))}</script>"""
+    return _page(deps, tenant, "phone", "AI phone", body)
+
+
 def _customers_page(deps: PortalDeps, tenant: Tenant) -> str:
     tz, now = _tz(tenant), time.time()
     customers = deps.tenants.list_customers(tenant.id, 500)
@@ -889,13 +1110,25 @@ load();
 
 _CALLS_JS = """
 function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function handled(c) {
+  const m = c.meta || {}, r = m.route || 'ai';
+  const tr = m.transfer_result ? ' (' + (m.transfer_result === 'completed' ? 'answered' : esc(m.transfer_result)) + ')' : '';
+  if (r === 'voicemail') return m.voicemail_url
+    ? `<a href="${esc(m.voicemail_url)}.mp3" target="_blank" rel="noopener">▶ Voicemail${m.voicemail_seconds ? ' ' + m.voicemail_seconds + 's' : ''}</a>`
+    : '<span class="mut">Voicemail (none left)</span>';
+  if (r === 'forwarded') return 'Forwarded to staff' + tr;
+  if (r === 'ai_transfer') return 'AI → staff' + tr;
+  if (r === 'closed') return '<span class="mut">Closed message</span>';
+  if (r === 'ai_off') return '<span class="mut">AI off</span>';
+  return 'AI';
+}
 function dur(c) { const s = Math.max(0, Math.round(c.updated_at - c.started_at)); return s >= 60 ? Math.floor(s/60) + 'm ' + String(s%60).padStart(2,'0') + 's' : s + 's'; }
 async function load() {
   const r = await fetch('/portal/api/calls'); if (!r.ok) return;
   const j = await r.json();
   const tb = document.getElementById('rows');
   const now = Date.now() / 1000;
-  if (!j.calls.length) { tb.innerHTML = '<tr><td colspan=6 class="mut">No calls yet. They appear here the moment a customer phones in.</td></tr>'; return; }
+  if (!j.calls.length) { tb.innerHTML = '<tr><td colspan=7 class="mut">No calls yet. They appear here the moment a customer phones in.</td></tr>'; return; }
   tb.innerHTML = j.calls.map(c => {
     const live = c.status === 'live' && now - c.updated_at < __STALE__;
     return `<tr>
@@ -903,6 +1136,7 @@ async function load() {
     <td><b>${esc(c.from_number || 'Unknown caller')}</b></td>
     <td class="mut">${new Date(c.started_at*1000).toLocaleString([], {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'})}</td>
     <td class="mut">${live ? '—' : dur(c)}</td>
+    <td>${handled(c)}</td>
     <td>${c.turn_count}</td>
     <td><a href="/portal/calls/${encodeURIComponent(c.call_sid)}">${live ? 'Listen in' : 'Details'}</a></td></tr>`;
   }).join('');
@@ -914,8 +1148,8 @@ load(); setInterval(load, 3000);
 def _calls_page(deps: PortalDeps, tenant: Tenant) -> str:
     body = _page_head("Live calls", "Every call the AI answers, live and recent. Updates every few seconds.") + """
 <div class="card"><div class="tbl-wrap"><table><thead><tr><th>Status</th><th>Caller</th><th>Started</th>
-<th>Length</th><th>Turns</th><th></th></tr></thead>
-<tbody id=rows><tr><td colspan=6 class="mut">Loading…</td></tr></tbody></table></div></div>
+<th>Length</th><th>Handled by</th><th>Turns</th><th></th></tr></thead>
+<tbody id=rows><tr><td colspan=7 class="mut">Loading…</td></tr></tbody></table></div></div>
 <script>""" + _CALLS_JS.replace("__STALE__", str(_LIVE_STALE_SECONDS)) + "</script>"
     return _page(deps, tenant, "calls", "Live calls", body)
 
@@ -923,6 +1157,7 @@ def _calls_page(deps: PortalDeps, tenant: Tenant) -> str:
 def _call_detail_page(deps: PortalDeps, tenant: Tenant, call_sid: str) -> str:
     body = f"""<p style="margin:0 0 20px"><a href="/portal/calls">{icon("back", 16)} All calls</a></p>
 <div class="page-h"><div><h2>Call transcript</h2><p id=head>Loading…</p></div></div>
+<div id=route-note></div>
 <div class="card"><div class="card-b" id=turns></div></div>
 <script>
 const SID = {json.dumps(call_sid)};
@@ -935,6 +1170,15 @@ async function load() {{
     `<span class="pill ${{j.status==='live'?'ok':''}}">${{esc(j.status)}}</span>
      &nbsp;From ${{esc(j.from_number||'unknown caller')}} · started
      ${{new Date(j.started_at*1000).toLocaleString()}}`;
+  const m = j.meta || {{}};
+  const note = document.getElementById('route-note');
+  if (m.route && m.route !== 'ai' && !note.dataset.done) {{
+    note.dataset.done = '1';
+    const why = m.reason ? ' — ' + m.reason : '';
+    note.innerHTML = m.voicemail_url
+      ? `<div class="alert"><b>Voicemail</b>${{esc(why)}}<audio controls preload="none" style="display:block;margin-top:10px;width:100%" src="${{esc(m.voicemail_url)}}.mp3"></audio></div>`
+      : `<div class="alert">Handled without the AI: <b>${{esc(m.route.replace('_', ' '))}}</b>${{esc(why)}}${{m.transfer_result ? ' · transfer ' + esc(m.transfer_result) : ''}}</div>`;
+  }}
   const el = document.getElementById('turns');
   el.innerHTML = j.turns.length ? j.turns.map(t => `
     <div class="bubble caller"><div class=w>Caller · ${{new Date(t.ts*1000).toLocaleTimeString()}}</div>
@@ -1264,6 +1508,102 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             return res
         _, tenant = res
         return _orders_page(deps, tenant)
+
+    @router.get("/portal/phone", response_class=HTMLResponse)
+    async def phone_page(request: Request, saved: int = 0):
+        res = page_user(request, "settings.edit")
+        if isinstance(res, RedirectResponse):
+            return res
+        _, tenant = res
+        return _phone_page(deps, tenant, saved=bool(saved))
+
+    @router.get("/portal/api/voice-routing")
+    async def api_routing_get(request: Request):
+        _, tenant = api_user(request, "settings.edit")
+        return _routing_view(deps, tenant)
+
+    @router.put("/portal/api/voice-routing")
+    async def api_routing_put(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        body = await request.json()
+        try:
+            windows = [routing.Window(int(w["day"]), _parse_hhmm(w["start"]), _parse_hhmm(w["end"]))
+                       for w in body.get("windows") or []]
+            cfg = routing.RoutingConfig(
+                mode=str(body.get("mode", "always_on")), off_action=str(body.get("off_action", "transfer")),
+                no_answer_action=str(body.get("no_answer_action", "voicemail")),
+                closed_message=str(body.get("closed_message", "")), windows=windows)
+            expected = body.get("expected_version")
+            deps.tenants.save_routing(tenant.id, cfg, user.id,
+                                      expected_version=int(expected) if expected is not None else None)
+        except (KeyError, TypeError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc) or "invalid schedule"}, status_code=400)
+        enabled = bool(body.get("enabled"))
+        if enabled != deps.tenants.flag_enabled(tenant.id, "voice_schedule_enabled"):
+            deps.tenants.set_flag(tenant.id, "voice_schedule_enabled", enabled, actor=user.id)
+        return {"ok": True}
+
+    @router.post("/portal/api/voice-routing/pause")
+    async def api_routing_pause(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        until = str((await request.json()).get("until", ""))
+        now = time.time()
+        if until == "1h":
+            ends = now + 3600
+        elif until == "midnight":
+            tz = _tz(tenant)
+            tomorrow = _dt(now, tz).date() + timedelta(days=1)
+            midnight = datetime(tomorrow.year, tomorrow.month, tomorrow.day)
+            ends = (midnight.replace(tzinfo=tz) if tz else midnight).timestamp()
+        elif until == "resume":
+            ends = None
+        else:
+            return JSONResponse({"ok": False, "error": "unknown pause length"}, status_code=400)
+        deps.tenants.add_routing_override(tenant.id, now, ends, ai_on=False, kind="pause",
+                                          reason="", actor=user.id)
+        return {"ok": True}
+
+    @router.post("/portal/api/voice-routing/resume")
+    async def api_routing_resume(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        deps.tenants.cancel_routing_overrides(tenant.id, user.id, kind="pause")
+        cfg, _ = deps.tenants.routing_config(tenant.id)
+        if cfg.emergency_off:
+            deps.tenants.set_routing_emergency(tenant.id, False, user.id)
+        return {"ok": True}
+
+    @router.post("/portal/api/voice-routing/stop")
+    async def api_routing_stop(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        deps.tenants.set_routing_emergency(tenant.id, True, user.id)
+        return {"ok": True}
+
+    @router.post("/portal/api/voice-routing/exceptions")
+    async def api_routing_exception(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        body = await request.json()
+        tz = _tz(tenant)
+        try:
+            first = datetime.strptime(str(body["from"]), "%Y-%m-%d")
+            last = datetime.strptime(str(body.get("to") or body["from"]), "%Y-%m-%d")
+            if last < first or (last - first).days > 60:
+                raise ValueError("pick an end date on or after the start, within 60 days")
+            start = (first.replace(tzinfo=tz) if tz else first).timestamp()
+            end_day = last + timedelta(days=1)
+            end = (end_day.replace(tzinfo=tz) if tz else end_day).timestamp()
+            deps.tenants.add_routing_override(tenant.id, start, end, ai_on=bool(body.get("ai_on")),
+                                              kind="exception", reason=str(body.get("reason", "")),
+                                              actor=user.id)
+        except (KeyError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc) or "invalid dates"}, status_code=400)
+        return {"ok": True}
+
+    @router.delete("/portal/api/voice-routing/exceptions/{override_id}")
+    async def api_routing_exception_cancel(request: Request, override_id: str):
+        user, tenant = api_user(request, "settings.edit")
+        if not deps.tenants.cancel_routing_overrides(tenant.id, user.id, override_id=override_id):
+            raise HTTPException(status_code=404, detail="exception not found")
+        return {"ok": True}
 
     @router.get("/portal/customers", response_class=HTMLResponse)
     async def customers_page(request: Request):

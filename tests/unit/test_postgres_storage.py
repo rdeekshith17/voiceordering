@@ -21,7 +21,8 @@ pytestmark = pytest.mark.skipif(not URL, reason="TEST_DATABASE_URL not set")
 _TABLES = ["carts", "orders", "tenants", "tenant_settings", "tenant_secrets",
            "tenant_users", "call_transcripts", "tickets", "marketing_drafts", "usage_daily",
            "customers", "schema_migrations", "platform_users", "tenant_feature_flags",
-           "audit_logs", "job_runs"]
+           "audit_logs", "job_runs", "voice_routing", "voice_routing_windows",
+           "voice_routing_overrides"]
 
 
 @pytest.fixture(autouse=True)
@@ -136,3 +137,45 @@ def test_migrations_roles_flags_audit_and_leases_on_postgres():
     assert not tenants.try_start_job("billing", 600, 3600, now=1001)
     _, _, second_instance = _stores()  # another app instance sees the same lease
     assert not second_instance.try_start_job("billing", 600, 3600, now=1002)
+
+
+def test_voice_routing_on_postgres():
+    from voiceorder.routing import RoutingConfig, Window
+
+    _, _, tenants = _stores()
+    t = tenants.create_tenant("Hyderabad House")
+    v = tenants.save_routing(t.id, RoutingConfig(mode="scheduled", windows=[
+        Window(4, 18 * 60, 60), Window(0, 11 * 60, 14 * 60)]), actor="u1", expected_version=0)
+    cfg, version = tenants.routing_config(t.id)
+    assert version == v == 1 and [(w.day, w.start_min) for w in cfg.windows] == [(0, 660), (4, 1080)]
+    # A stale save (someone else saved first) is refused and changes nothing.
+    try:
+        tenants.save_routing(t.id, RoutingConfig(mode="scheduled", windows=[Window(1, 600, 700)]),
+                             actor="u1", expected_version=0)
+    except ValueError:
+        pass
+    assert len(tenants.routing_config(t.id)[0].windows) == 2
+    # A save that fails halfway (after deleting the old windows) is rolled back.
+    real_execute = tenants._conn.execute
+
+    def failing_insert(sql, params=()):
+        if sql.startswith("INSERT INTO voice_routing_windows"):
+            raise RuntimeError("connection dropped mid-save")
+        return real_execute(sql, params)
+    tenants._conn.execute = failing_insert
+    try:
+        tenants.save_routing(t.id, RoutingConfig(mode="always_off", windows=[Window(2, 1, 2)]), actor="u1")
+    except RuntimeError:
+        pass
+    finally:
+        tenants._conn.execute = real_execute
+    cfg, version = tenants.routing_config(t.id)
+    assert cfg.mode == "scheduled" and len(cfg.windows) == 2 and version == 1
+    oid = tenants.add_routing_override(t.id, 1000, None, ai_on=False, kind="pause", reason="", actor="u1")
+    assert tenants.routing_config(t.id, now=1001)[0].overrides[0].id == oid
+    assert tenants.cancel_routing_overrides(t.id, "u1", kind="pause", now=1002) == 1
+    tenants.set_routing_emergency("*", True, actor="ops")
+    assert tenants.platform_emergency() is True
+    tenants.start_call("CA1", t.id, "+1", "+2")
+    tenants.set_call_meta("CA1", route="voicemail", voicemail_seconds=12)
+    assert tenants.get_transcript(t.id, "CA1")["meta"] == {"route": "voicemail", "voicemail_seconds": 12}

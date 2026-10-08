@@ -90,12 +90,61 @@ def _m005_job_runs(db: Database) -> None:
     """)
 
 
+def _m006_voice_routing(db: Database) -> None:
+    # Per-restaurant AI answering policy. tenant_id '*' holds the platform
+    # emergency stop. Windows are local wall-clock minutes (0-1439) per weekday
+    # (0 = Monday); end <= start means the window runs past midnight.
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS voice_routing (
+          tenant_id TEXT PRIMARY KEY,
+          mode TEXT NOT NULL DEFAULT 'always_on',
+          off_action TEXT NOT NULL DEFAULT 'transfer',
+          no_answer_action TEXT NOT NULL DEFAULT 'voicemail',
+          closed_message TEXT NOT NULL DEFAULT '',
+          emergency_off INTEGER NOT NULL DEFAULT 0,
+          version INTEGER NOT NULL DEFAULT 1,
+          updated_at REAL NOT NULL,
+          updated_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS voice_routing_windows (
+          tenant_id TEXT NOT NULL,
+          day INTEGER NOT NULL,
+          start_min INTEGER NOT NULL,
+          end_min INTEGER NOT NULL,
+          PRIMARY KEY (tenant_id, day, start_min)
+        );
+        CREATE TABLE IF NOT EXISTS voice_routing_overrides (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL,
+          starts_at REAL NOT NULL,
+          ends_at REAL,
+          ai_on INTEGER NOT NULL DEFAULT 0,
+          kind TEXT NOT NULL DEFAULT 'pause',
+          reason TEXT NOT NULL DEFAULT '',
+          created_by TEXT NOT NULL DEFAULT '',
+          created_at REAL NOT NULL,
+          cancelled_at REAL
+        );
+        CREATE INDEX IF NOT EXISTS idx_routing_overrides_tenant
+          ON voice_routing_overrides (tenant_id, starts_at);
+    """)
+
+
+def _m007_call_meta(db: Database) -> None:
+    # How each call was routed (AI / forwarded / voicemail / closed) and any
+    # voicemail recording link, as JSON.
+    if "meta" not in db.columns("call_transcripts"):
+        db.execute("ALTER TABLE call_transcripts ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
+
+
 MIGRATIONS: list[tuple[str, Callable[[Database], None]]] = [
     ("001_user_roles", _m001_user_roles),
     ("002_platform_users", _m002_platform_users),
     ("003_feature_flags", _m003_feature_flags),
     ("004_audit_logs", _m004_audit_logs),
     ("005_job_runs", _m005_job_runs),
+    ("006_voice_routing", _m006_voice_routing),
+    ("007_call_meta", _m007_call_meta),
 ]
 
 

@@ -83,13 +83,41 @@ def end_call(reply_audio_url: str | None, reply_text: str) -> str:
     return _response(f"{spoken}<Hangup />")
 
 
-def transfer_call(announcement_audio_url: str | None, announcement: str, number: str) -> str:
-    """Play the handoff line, then dial the restaurant for real."""
+def transfer_call(announcement_audio_url: str | None, announcement: str, number: str,
+                  action_url: str | None = None, timeout: int = 20) -> str:
+    """Play the handoff line, then dial the restaurant for real.
+
+    With action_url, the call rings for `timeout` seconds and Twilio then posts
+    the outcome (DialCallStatus) there, so a busy or unanswered line can fall
+    back to voicemail or a message instead of just ending."""
     if announcement_audio_url:
         spoken = f"<Play>{escape(announcement_audio_url)}</Play>"
-    else:
+    elif announcement:
         spoken = f"<Say>{escape(announcement)}</Say>"
-    return _response(f"{spoken}<Dial>{escape(number)}</Dial>")
+    else:
+        spoken = ""
+    if action_url:
+        dial = (f'<Dial timeout="{int(timeout)}" action="{escape(action_url)}" method="POST">'
+                f"{escape(number)}</Dial>")
+    else:
+        dial = f"<Dial>{escape(number)}</Dial>"
+    return _response(f"{spoken}{dial}")
+
+
+def voicemail(prompt: str, action_url: str, max_seconds: int = 120) -> str:
+    """Invite a message after the beep; Twilio posts the recording to action_url.
+    If the caller records nothing, Twilio continues to the goodbye line."""
+    return _response(
+        f"<Say>{escape(prompt)}</Say>"
+        f'<Record maxLength="{int(max_seconds)}" playBeep="true" trim="trim-silence" '
+        f'action="{escape(action_url)}" method="POST" />'
+        "<Say>We didn't get a message. Goodbye.</Say><Hangup />"
+    )
+
+
+def closed_message(message: str) -> str:
+    """Say the restaurant's message and end the call."""
+    return _response(f"<Say>{escape(message)}</Say><Hangup />")
 
 
 def unavailable() -> str:

@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape as _xml_escape
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, Response
@@ -45,6 +46,7 @@ from ..agent.loop import AgentSession
 from ..agent.prompt import returning_name, spoken_phone
 from ..core import tools
 from ..db import describe as describe_db, is_postgres
+from .. import routing as call_routing
 from ..core.cart import CartState
 from ..core.catalog import Catalog
 from ..core.ports import RestaurantContext
@@ -59,7 +61,7 @@ from ..voice_adapters import twilio as twilio_adapter
 from ..voice_adapters.text import TextAdapter
 from .owner import OwnerDeps, build_owner_router
 from ..portal.portal import PortalDeps, build_portal_router
-from ..tenants.store import Tenant, TenantStore, normalize_number
+from ..tenants.store import Tenant, TenantStore, normalize_number, real_transfer_number
 from .storage import (
     InMemoryCartStore,
     InMemoryOrderStore,
@@ -459,7 +461,9 @@ def _drop_tenant_caches(tenant_id: str) -> None:
 
 def resolve_call_tenant(to_number: str) -> Tenant:
     """Route an incoming call to the tenant owning the dialed number."""
-    return tenant_store.get_tenant_by_number(to_number) or default_tenant
+    # Fresh read: the startup copy of default_tenant doesn't see later settings changes.
+    return (tenant_store.get_tenant_by_number(to_number)
+            or tenant_store.get_tenant(default_tenant.id) or default_tenant)
 
 
 def restaurant_context() -> RestaurantContext:
@@ -847,6 +851,99 @@ def _twiml_response(xml: str) -> Response:
     return Response(content=xml, media_type="application/xml")
 
 
+# --- AI ON/OFF routing (PR 2) ---------------------------------------------------
+def routing_decision(tenant: Tenant, now: float | None = None
+                     ) -> tuple[call_routing.Decision, call_routing.RoutingConfig, bool]:
+    """(decision, config, controls_enabled) for a new call to this restaurant.
+
+    With the voice_schedule_enabled flag off the AI answers every call, exactly
+    as before. If the policy can't be read, the call goes to staff when a real
+    number is set (never silently to the AI against the owner's wishes), else
+    to the AI so the caller isn't dropped."""
+    now = now if now is not None else time.time()
+    try:
+        if not tenant_store.flag_enabled(tenant.id, "voice_schedule_enabled"):
+            return call_routing.Decision(True, "AI controls not enabled"), call_routing.RoutingConfig(), False
+        cfg, _ = tenant_store.routing_config(tenant.id, now)
+        zone = tenant.setting("timezone", "")
+        tz = ZoneInfo(zone) if zone else None
+        return call_routing.evaluate(cfg, now, tz, tenant_store.platform_emergency()), cfg, True
+    except Exception:
+        log.exception("routing policy unavailable for tenant %s", tenant.id)
+        has_staff = bool(real_transfer_number(tenant_context(tenant).transfer_number))
+        cfg = call_routing.RoutingConfig(off_action="transfer", no_answer_action="message")
+        return call_routing.Decision(not has_staff, "Routing policy unavailable"), cfg, True
+
+
+def _closed_text(tenant: Tenant, cfg: call_routing.RoutingConfig) -> str:
+    name = tenant_context(tenant).restaurant_name
+    return cfg.closed_message.strip() or (
+        f"Thanks for calling {name}. We can't take your call right now. "
+        "Please call back during our opening hours.")
+
+
+def _no_answer_twiml(tenant: Tenant, cfg: call_routing.RoutingConfig, call_sid: str) -> str:
+    """What the caller gets when nobody (AI or staff) can take the call."""
+    if cfg.no_answer_action == "voicemail" or cfg.off_action == "voicemail":
+        tenant_store.set_call_meta(call_sid, route="voicemail")
+        name = tenant_context(tenant).restaurant_name
+        return twilio_adapter.voicemail(
+            f"Thanks for calling {name}. Please leave your name, number and message "
+            "after the beep, and we'll call you back.",
+            f"{_public_base_url()}/twilio/voicemail?tid={tenant.id}")
+    tenant_store.set_call_meta(call_sid, route="closed")
+    return twilio_adapter.closed_message(_closed_text(tenant, cfg))
+
+
+def _ai_off_twiml(tenant: Tenant, cfg: call_routing.RoutingConfig, call_sid: str) -> str:
+    """The AI isn't answering: forward to staff, take a voicemail, or say the message."""
+    if cfg.off_action == "transfer":
+        number = real_transfer_number(tenant_context(tenant).transfer_number)
+        if number:
+            tenant_store.set_call_meta(call_sid, route="forwarded", forwarded_to=number[-4:])
+            return twilio_adapter.transfer_call(
+                None, "", number, action_url=f"{_public_base_url()}/twilio/dial-status?tid={tenant.id}")
+        return _no_answer_twiml(tenant, cfg, call_sid)
+    if cfg.off_action == "voicemail":
+        return _no_answer_twiml(tenant, cfg, call_sid)
+    tenant_store.set_call_meta(call_sid, route="closed")
+    return twilio_adapter.closed_message(_closed_text(tenant, cfg))
+
+
+@app.post("/twilio/dial-status")
+async def twilio_dial_status(request: Request) -> Response:
+    """Twilio webhook: a forwarded call finished ringing. Hang up if staff
+    answered; otherwise fall back to voicemail or the closed message."""
+    form = {k: v for k, v in (await request.form()).items()}
+    if not _twilio_signature_ok(request, form):
+        raise HTTPException(status_code=403, detail="bad twilio signature")
+    call_sid = str(form.get("CallSid", ""))
+    outcome = str(form.get("DialCallStatus", ""))
+    tenant = tenant_store.get_tenant(str(request.query_params.get("tid", ""))) or default_tenant
+    tenant_store.set_call_meta(call_sid, transfer_result=outcome or "unknown")
+    if outcome == "completed":
+        return _twiml_response('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup /></Response>')
+    log.info("twilio call %s: transfer %s, falling back", call_sid, outcome or "failed")
+    cfg, _ = tenant_store.routing_config(tenant.id)
+    return _twiml_response(_no_answer_twiml(tenant, cfg, call_sid))
+
+
+@app.post("/twilio/voicemail")
+async def twilio_voicemail(request: Request) -> Response:
+    """Twilio webhook: a voicemail was recorded. Save the link on the call."""
+    form = {k: v for k, v in (await request.form()).items()}
+    if not _twilio_signature_ok(request, form):
+        raise HTTPException(status_code=403, detail="bad twilio signature")
+    call_sid = str(form.get("CallSid", ""))
+    url = str(form.get("RecordingUrl", ""))
+    if url.startswith("https://api.twilio.com/"):
+        tenant_store.set_call_meta(call_sid, route="voicemail", voicemail_url=url,
+                                   voicemail_seconds=int(form.get("RecordingDuration", 0) or 0))
+    log.info("twilio call %s: voicemail saved", call_sid)
+    return _twiml_response(twilio_adapter.closed_message(
+        "Thanks, we got your message and will call you back. Goodbye."))
+
+
 @app.post("/twilio/voice")
 async def twilio_voice(request: Request) -> Response:
     """Twilio webhook: a call just came in. Greet and start listening."""
@@ -857,6 +954,14 @@ async def twilio_voice(request: Request) -> Response:
     if not call_sid:
         raise HTTPException(status_code=400, detail="missing CallSid")
     tenant = resolve_call_tenant(str(form.get("To", "")))
+    decision, routing_cfg, controls = routing_decision(tenant)
+    if not decision.ai:
+        tenant_store.start_call(
+            call_sid, tenant.id, str(form.get("From", "")), str(form.get("To", ""))
+        )
+        tenant_store.set_call_meta(call_sid, route="ai_off", reason=decision.reason)
+        log.info("twilio call %s: AI off for %s (%s)", call_sid, tenant.name, decision.reason)
+        return _twiml_response(_ai_off_twiml(tenant, routing_cfg, call_sid))
     session = _new_twilio_session(tenant, str(form.get("From", "")))
     if session is None:
         log.warning("twilio call %s: LLM not configured", call_sid)
@@ -865,6 +970,8 @@ async def twilio_voice(request: Request) -> Response:
     tenant_store.start_call(
         call_sid, tenant.id, str(form.get("From", "")), str(form.get("To", ""))
     )
+    if controls:
+        tenant_store.set_call_meta(call_sid, route="ai", reason=decision.reason)
     ctx = tenant_context(tenant)
     greeting = _greeting(ctx, session.caller)
     base = _public_base_url()
@@ -1060,9 +1167,19 @@ def _twilio_final_twiml(
         _twilio_sessions.pop(call_sid, None)
     if cart.transferred:
         log.info("twilio call %s: transferring to %s", call_sid, session.ctx.transfer_number)
+        tenant = tenant_store.get_tenant(session.ctx.tenant_id) if session.ctx.tenant_id else None
+        if tenant is None or not tenant_store.flag_enabled(tenant.id, "voice_schedule_enabled"):
+            return twilio_adapter.transfer_call(  # unchanged behaviour without AI controls
+                audio_url, reply, session.ctx.transfer_number
+            )
+        tenant_store.set_call_meta(call_sid, route="ai_transfer")
+        number = real_transfer_number(session.ctx.transfer_number)
+        if not number:
+            cfg, _ = tenant_store.routing_config(tenant.id)
+            return _no_answer_twiml(tenant, cfg, call_sid)
         return twilio_adapter.transfer_call(
-            audio_url, reply, session.ctx.transfer_number
-        )
+            audio_url, reply, number,
+            action_url=f"{_public_base_url()}/twilio/dial-status?tid={tenant.id}")
     if cart.state == CartState.SUBMITTED:
         from_number = str(form.get("From", ""))
         _persist_submitted_order(cart, call_sid, session.ctx, caller_number=from_number)
