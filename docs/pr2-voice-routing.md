@@ -4,7 +4,7 @@ Restaurants choose when the AI answers calls and what callers get when it
 doesn't. Off by default: until a restaurant ticks **Use AI phone controls** on
 the new **AI phone** page, every call is answered by the AI exactly as before.
 
-## Owner / manager experience (Portal → Management → AI phone)
+## Restaurant admin experience (Portal → Management → AI phone)
 
 - **Status card:** what happens to a call right now, why, and the next change
   ("AI is off: calls are forwarded to staff · Outside scheduled hours. Next
@@ -55,7 +55,7 @@ off now" → newest active pause/exception → mode (always on / off / schedule)
 | Store | `routing_config`, `save_routing` (versioned, all-or-nothing), pauses/exceptions, emergency stops, `set_call_meta` |
 | DB layer | `Database.transaction()` for multi-statement saves |
 | Twilio | `/twilio/dial-status`, `/twilio/voicemail` (signature-checked); `transfer_call` gains timeout + action; `voicemail`, `closed_message` TwiML |
-| Portal | `/portal/phone`; APIs `GET/PUT /portal/api/voice-routing`, `POST …/pause`, `…/resume`, `…/stop`, `POST/DELETE …/exceptions` (owner/manager) |
+| Portal | `/portal/phone`; APIs `GET/PUT /portal/api/voice-routing`, `POST …/pause`, `…/resume`, `…/stop`, `POST/DELETE …/exceptions` (admin only) |
 | Fix | Calls to unmapped numbers now read the default restaurant fresh, not the startup copy |
 | Audit | Mode/schedule saves, flag changes, pauses, exceptions, cancellations, emergency stops |
 
