@@ -47,6 +47,7 @@ from ..agent.prompt import returning_name, spoken_phone
 from ..core import tools
 from ..db import describe as describe_db, is_postgres
 from .. import approvals as hitl
+from .. import logsafe
 from .. import routing as call_routing
 from ..core.ports import ToolResult
 from ..core.cart import CartState
@@ -63,7 +64,9 @@ from ..voice_adapters import twilio as twilio_adapter
 from ..voice_adapters.text import TextAdapter
 from .owner import OwnerDeps, build_owner_router
 from ..admin.admin import AdminDeps, build_admin_router
-from ..portal.portal import PortalDeps, build_portal_router
+from ..portal.portal import PortalDeps, build_portal_router, is_https as portal_is_https
+from ..portal.portal import session_user as portal_session_user
+from ..tenants import rbac
 from ..tenants.store import Tenant, TenantStore, normalize_number, real_transfer_number
 from .storage import (
     InMemoryCartStore,
@@ -74,6 +77,7 @@ from .storage import (
 
 log = logging.getLogger("voiceorder")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logsafe.install()  # mask customer phone numbers in every log line
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -486,7 +490,27 @@ def require_secret(x_voice_secret: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=401, detail="invalid voice secret")
 
 
+def _owner_session_ok(request: Request) -> bool:
+    """Legacy /owner pages: a signed-in admin of the default restaurant."""
+    user = portal_session_user(request, tenant_store)
+    return bool(user and user.tenant_id == default_tenant.id and rbac.can(user.role, "settings.edit"))
+
+
 app = FastAPI(title="VoiceOrderAI", version="0.4.0")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    """Browser hardening for every response: no framing by other sites, no MIME
+    sniffing, minimal referrer, and HTTPS-only on HTTPS deployments."""
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Content-Security-Policy", "frame-ancestors 'none'")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    if portal_is_https(request):
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000")
+    return response
 app.include_router(
     build_owner_router(
         OwnerDeps(
@@ -496,6 +520,7 @@ app.include_router(
             order_store=order_store,
             ctx=restaurant_context(),
             owner_secret=settings.owner_secret,
+            session_ok=_owner_session_ok,
         )
     )
 )
@@ -508,6 +533,8 @@ app.include_router(
             build_adapter=tenant_pos_adapter,
             get_catalog=tenant_catalog,
             on_config_changed=_drop_tenant_caches,
+            # Public self-signup; turn off (0) once restaurants are added from /admin.
+            signup_enabled=os.environ.get("PORTAL_SIGNUP_ENABLED", "1") != "0",
         )
     )
 )
@@ -575,13 +602,38 @@ box.addEventListener('keydown',e=>{if(e.key==='Enter')send();});
 </script></body></html>"""
 
 
+def _chat_enabled() -> bool:
+    """The public text demo places real orders through the restaurant's POS and
+    spends AI credits, so production turns it off (CHAT_DEMO_ENABLED=0)."""
+    return os.environ.get("CHAT_DEMO_ENABLED", "1") != "0"
+
+
+# Per-visitor limit on demo chat messages: client IP -> recent message times.
+_CHAT_LIMIT, _CHAT_WINDOW = 30, 600
+_chat_hits: dict[str, list[float]] = {}
+
+
+def _chat_guard(request: Request) -> None:
+    if not _chat_enabled():
+        raise HTTPException(status_code=404, detail="the text demo is turned off")
+    ip = request.client.host if request.client else "unknown"
+    now = time.time()
+    hits = [t for t in _chat_hits.get(ip, []) if now - t < _CHAT_WINDOW]
+    if len(hits) >= _CHAT_LIMIT:
+        raise HTTPException(status_code=429, detail="too many messages; try again later")
+    _chat_hits[ip] = hits + [now]
+
+
 @app.get("/chat", response_class=HTMLResponse)
 def chat_page() -> str:
+    if not _chat_enabled():
+        raise HTTPException(status_code=404, detail="the text demo is turned off")
     return CHAT_PAGE
 
 
 @app.post("/chat/start", response_model=ChatStartResponse)
-def chat_start() -> ChatStartResponse:
+def chat_start(request: Request) -> ChatStartResponse:
+    _chat_guard(request)
     llm = _chat_llm_client()
     model = os.environ.get("ANTHROPIC_MODEL", "")
     if not model:
@@ -602,13 +654,15 @@ def chat_start() -> ChatStartResponse:
 
 
 @app.post("/chat/message")
-def chat_message(req: ChatMessageRequest) -> dict:
+def chat_message(req: ChatMessageRequest, request: Request) -> dict:
+    _chat_guard(request)
     session = _chat_sessions.get(req.session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="unknown chat session")
     turn = session.handle_caller_message(req.text)
     cart = session.cart
     call_id = _chat_call_id(req.session_id)
+    _park_if_pos_failed(cart, session.ctx, call_id, turn.get("tool_calls"))
     try:
         tenant_store.append_turn(call_id, req.text, turn["text"], turn.get("tool_calls") or [])
     except Exception:
@@ -1016,9 +1070,13 @@ def _session_for(call_sid: str) -> AgentSession | None:
     session = _twilio_sessions.get(call_sid)
     if session is not None or not call_sid:
         return session
-    saved = tenant_store.load_call_session(call_sid)
-    tenant = tenant_store.get_tenant(saved["tenant_id"]) if saved else None
-    cart = cart_store.get(saved["cart_id"]) if saved else None
+    try:
+        saved = tenant_store.load_call_session(call_sid)
+        tenant = tenant_store.get_tenant(saved["tenant_id"]) if saved else None
+        cart = cart_store.get(saved["cart_id"]) if saved else None
+    except Exception:
+        log.warning("twilio call %s: couldn't restore the session", call_sid, exc_info=True)
+        return None
     if not (saved and tenant and cart):
         return None
     try:
@@ -1052,8 +1110,22 @@ async def twilio_hold(request: Request) -> Response:
     if session is None:
         return _twiml_response(twilio_adapter.end_call(None, "Sorry, I lost track of your call. Goodbye."))
     tenant_id = session.ctx.tenant_id
-    approval = tenant_store.get_approval(tenant_id, approval_id)
     base = _public_base_url()
+    try:
+        approval = tenant_store.get_approval(tenant_id, approval_id)
+    except Exception:
+        # Database blip: keep the caller on hold and try again, up to the poll cap;
+        # past that, apologize and carry on (never treated as an approval).
+        log.warning("twilio call %s: approval read failed while on hold", call_sid, exc_info=True)
+        if poll_n < 60:
+            poll = _xml_escape(f"{base}/twilio/hold?aid={approval_id}&sid={call_sid}&n={poll_n + 1}")
+            return _twiml_response(
+                f'<?xml version="1.0" encoding="UTF-8"?><Response><Pause length="3"/>'
+                f'<Redirect method="POST">{poll}</Redirect></Response>')
+        session.state.pop("awaiting_approval", None)
+        return _twiml_response(twilio_adapter.continue_call(
+            None, "Sorry, I couldn't reach the kitchen. I can take the order without that "
+                  "request, or connect you to the restaurant.", f"{base}/twilio/gather"))
     if approval and approval["status"] == "pending":
         if time.time() >= approval["deadline_at"] or poll_n >= 60:
             tenant_store.expire_approval(tenant_id, approval_id, now=max(time.time(), approval["deadline_at"]))
@@ -1259,6 +1331,8 @@ def _run_turn_background(
                 and hitl.mentions_allergy(speech):
             state["allergy"] = True
         turn = session.handle_caller_message(speech)
+        _park_if_pos_failed(session.cart, session.ctx, call_sid, turn.get("tool_calls"),
+                            (getattr(session, "caller", None) or {}).get("phone", ""))
         log.info(
             "twilio call %s turn: heard=%r tools=%s reply=%r",
             call_sid,
@@ -1455,7 +1529,7 @@ a.btn.alt{background:#5f6368}p{color:#555}</style></head><body>
 <p>AI phone ordering for restaurants. Manage your restaurant below, or try the text demo.</p>
 <a class="btn" href="/portal/login">Restaurant portal</a>
 <a class="btn alt" href="/owner">Owner dashboard</a>
-<a class="btn alt" href="/chat">Text demo</a>
+""" + ('<a class="btn alt" href="/chat">Text demo</a>' if _chat_enabled() else "") + """
 </body></html>"""
 
 
@@ -1516,6 +1590,40 @@ def _persist_submitted_order(cart, call_id: str, ctx: RestaurantContext,
     _remember_customer(cart, ctx, caller_number)
 
 
+def park_failed_order(cart, ctx: RestaurantContext, call_id: str, caller_number: str = "") -> None:
+    """The POS refused or was down: keep the order where staff will see it (Orders,
+    status "pos_failed") and raise a critical alert to call the customer back.
+    Idempotent per cart, so a retried submit never creates a second entry."""
+    lines = getattr(cart, "lines", None) or []
+    phone = getattr(cart, "customer_phone", None) or caller_number
+    name = getattr(cart, "customer_name", None) or "the caller"
+    items = ", ".join(f"{l.quantity} {l.item_name}" for l in lines) or "items not captured"
+    try:
+        order_store.save({
+            "order_id": f"parked-{cart.cart_id}", "restaurant_id": ctx.restaurant_id,
+            "tenant_id": ctx.tenant_id, "call_id": call_id, "cart_id": cart.cart_id,
+            "order_number": f"P-{cart.cart_id[:6].upper()}", "status": "pos_failed",
+            "totals": {"total": round(sum(float(l.line_total) for l in lines), 2)},
+            "customer_name": getattr(cart, "customer_name", None), "customer_phone": phone,
+            "lines": [l.to_dict() for l in lines]})
+        if ctx.tenant_id:
+            tenant_store.open_ticket(
+                ctx.tenant_id, f"pos_failed_order:{cart.cart_id}", "critical",
+                f"Order didn't reach the POS: call {name} back",
+                f"Phone: {phone or 'unknown'}. Items: {items}. Enter it in the POS by hand, "
+                "then call the customer to confirm.")
+        log.warning("order on %s parked for staff: POS unavailable", call_id)
+    except Exception:
+        log.exception("could not park the failed order for %s", call_id)
+
+
+def _park_if_pos_failed(cart, ctx: RestaurantContext, call_id: str, tool_calls: list,
+                        caller_number: str = "") -> None:
+    if any(c.get("name") == "submit_order" and c.get("error_code") == "pos_unavailable"
+           for c in tool_calls or []):
+        park_failed_order(cart, ctx, call_id, caller_number)
+
+
 def _remember_customer(cart, ctx: RestaurantContext, caller_number: str = "") -> None:
     """Save who ordered (name, numbers, what they had) so the next call from
     their number is greeted by name. Caller ID wins over a spoken number; a
@@ -1553,6 +1661,8 @@ def run_tool(name: str, req: ToolRequest, _auth: None = Depends(require_secret))
     cart_store.save(cart)
     if name == "submit_order" and result.ok:
         _persist_submitted_order(cart, req.call_id, ctx)
+    elif name == "submit_order" and result.error_code == "pos_unavailable":
+        park_failed_order(cart, ctx, req.call_id)
     return result.to_dict()
 
 

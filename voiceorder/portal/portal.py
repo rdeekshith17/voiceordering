@@ -265,7 +265,7 @@ def _order_status(o: dict) -> tuple[str, str]:
         cls = "ok"
     elif s in ("preparing", "in_progress", "open", "accepted"):
         cls = "warn"
-    elif s in ("failed", "canceled", "cancelled", "rejected", "error"):
+    elif s in ("failed", "canceled", "cancelled", "rejected", "error", "pos_failed"):
         cls = "bad"
     else:
         cls = ""
@@ -1505,11 +1505,33 @@ def _session_user(request: Request, deps: PortalDeps) -> PortalUser | None:
     return user
 
 
-def _set_login_cookie(resp: RedirectResponse, user: PortalUser) -> None:
+def session_user(request: Request, tenants: TenantStore) -> PortalUser | None:
+    """The signed-in portal user, for other routers (e.g. the legacy /owner pages)."""
+    raw = request.cookies.get(COOKIE_NAME, "")
+    data = crypto.read_session_cookie(raw) if raw else None
+    if not data:
+        return None
+    user = tenants.get_user(data.get("uid", ""))
+    return user if user and user.tenant_id == data.get("tid") else None
+
+
+def is_https(request: Request) -> bool:
+    """True when the visitor reached us over HTTPS (Render terminates TLS at its
+    proxy and says so in X-Forwarded-Proto)."""
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or forwarded == "https"
+
+
+# Portal login lockout: email -> recent failure times.
+_FAILED_LOGINS: dict[str, list[float]] = {}
+_MAX_FAILURES, _FAILURE_WINDOW = 5, 15 * 60
+
+
+def _set_login_cookie(resp: RedirectResponse, user: PortalUser, secure: bool = False) -> None:
     resp.set_cookie(
         COOKIE_NAME,
         crypto.make_session_cookie({"uid": user.id, "tid": user.tenant_id}),
-        max_age=86400 * 7, httponly=True, samesite="lax", path="/",
+        max_age=86400 * 7, httponly=True, samesite="lax", path="/", secure=secure,
     )
 
 
@@ -1557,17 +1579,27 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
     @router.post("/portal/login")
     async def login_post(request: Request):
         form = await request.form()
-        user = deps.tenants.verify_user(
-            str(form.get("email", "")), str(form.get("password", ""))
-        )
+        email = str(form.get("email", "")).strip().lower()
+        now = time.time()
+        recent = [t for t in _FAILED_LOGINS.get(email, []) if now - t < _FAILURE_WINDOW]
+        if len(recent) >= _MAX_FAILURES:
+            if len(recent) == _MAX_FAILURES:  # audit the lockout once, not every attempt
+                deps.tenants.audit("user", email, None, "portal.login_locked", "portal")
+                _FAILED_LOGINS[email] = recent + [now]
+            return HTMLResponse(
+                _login_page(deps.platform_name, "Too many attempts. Try again in 15 minutes.",
+                            signup=deps.signup_enabled), status_code=429)
+        user = deps.tenants.verify_user(email, str(form.get("password", "")))
         if not user:
+            _FAILED_LOGINS[email] = recent + [now]
             return HTMLResponse(
                 _login_page(deps.platform_name, "Invalid email or password.",
                             signup=deps.signup_enabled),
                 status_code=401,
             )
+        _FAILED_LOGINS.pop(email, None)
         resp = RedirectResponse(rbac.home_page(user.role), status_code=302)
-        _set_login_cookie(resp, user)
+        _set_login_cookie(resp, user, secure=is_https(request))
         return resp
 
     @router.get("/portal/signup", response_class=HTMLResponse)
@@ -1613,7 +1645,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
         deps.tenants.audit("user", user.id, tenant.id, "account.signup", f"user:{user.id}",
                            None, {"restaurant": tenant.name, "email": user.email, "role": user.role})
         resp = RedirectResponse("/portal/pos", status_code=302)
-        _set_login_cookie(resp, user)
+        _set_login_cookie(resp, user, secure=is_https(request))
         log.info("portal signup: tenant %s (%s)", tenant.id, tenant.name)
         return resp
 

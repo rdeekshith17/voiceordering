@@ -53,7 +53,7 @@ def platform_can(role: str | None, permission: str) -> bool:
 
 # -- feature flags -----------------------------------------------------------
 # Every new capability ships behind one of these, default OFF per tenant.
-KNOWN_FLAGS = ("voice_schedule_enabled", "hitl_enabled", "multilingual_enabled")
+KNOWN_FLAGS = ("voice_schedule_enabled", "hitl_enabled")
 
 
 def env_killed(flag: str) -> bool:

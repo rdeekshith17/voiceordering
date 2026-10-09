@@ -25,7 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .. import routing
 from ..portal import ui
-from ..portal.portal import TIMEZONES
+from ..portal.portal import TIMEZONES, is_https
 from ..portal.ui import icon
 from ..tenants import crypto, rbac
 from ..tenants.store import PlatformUser, Tenant, TenantStore, normalize_number, real_transfer_number
@@ -50,8 +50,7 @@ NAV = [
         ("audit", "Audit log", "/admin/audit", "help"),
     ]),
 ]
-_FLAG_LABELS = {"voice_schedule_enabled": "AI phone controls", "hitl_enabled": "Kitchen approvals",
-                "multilingual_enabled": "Multilingual (PR 5)"}
+_FLAG_LABELS = {"voice_schedule_enabled": "AI phone controls", "hitl_enabled": "Kitchen approvals"}
 
 
 @dataclass
@@ -500,7 +499,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         resp = RedirectResponse("/admin/", status_code=302)
         resp.set_cookie(COOKIE_NAME, crypto.make_session_cookie(
             {"pid": admin.id, "kind": "platform"}, ttl_seconds=_SESSION_SECONDS, purpose="admin"),
-            max_age=_SESSION_SECONDS, httponly=True, samesite="strict", path="/admin")
+            max_age=_SESSION_SECONDS, httponly=True, samesite="strict", path="/admin",
+            secure=is_https(request))
         return resp
 
     @router.get("/admin/logout")
