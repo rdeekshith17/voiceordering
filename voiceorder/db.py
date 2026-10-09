@@ -12,12 +12,13 @@ is retried once on a fresh one.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import sqlite3
 import threading
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 log = logging.getLogger("voiceorder.db")
 
@@ -104,6 +105,21 @@ class Database:
         for stmt in script.split(";"):
             if stmt.strip():
                 self.execute(stmt)
+
+    @contextlib.contextmanager
+    def transaction(self) -> Iterator[None]:
+        """Run several statements all-or-nothing (callers hold their store lock,
+        so no other thread's statements interleave on this connection)."""
+        if not self.pg:
+            try:
+                yield
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            return
+        with self._conn.transaction():
+            yield
 
     def commit(self) -> None:
         if not self.pg:

@@ -13,6 +13,7 @@ import json
 import logging
 import time
 import uuid
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, tzinfo
 from typing import Any, Callable
@@ -22,7 +23,10 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from ..tenants import crypto
-from ..tenants.store import PortalUser, Tenant, TenantStore
+from .. import approvals as hitl
+from .. import routing
+from ..tenants import rbac
+from ..tenants.store import PortalUser, Tenant, TenantStore, normalize_number, real_transfer_number
 from ..voice import tts
 from ..voice import voices as voice_catalog
 from ..voice.tts import TtsError
@@ -138,6 +142,18 @@ _TZ_GUESS_JS = """<script>(function(){try{
     var n=document.getElementById('tz-guess'); if(n) n.hidden=false;}
 }catch(e){}})();</script>"""
 
+# Role of the user the current page is rendered for (set by page_user), so the
+# sidebar only shows pages that role may open.
+_viewer_role: ContextVar[str] = ContextVar("viewer_role", default="admin")
+
+# Sidebar key -> permission needed to see it.
+_NAV_PERMISSION = {
+    "dash": "reports.view", "stats": "reports.view", "orders": "orders.view",
+    "customers": "customers.view", "calls": "calls.view", "pos": "pos.edit",
+    "marketing": "reports.view", "usage": "reports.view", "support": "support.use",
+    "settings": "settings.edit", "phone": "settings.edit", "kitchen": "approvals.decide",
+}
+
 # A call still marked live after this long without a turn lost its status webhook.
 _LIVE_STALE_SECONDS = 1800
 
@@ -249,7 +265,7 @@ def _order_status(o: dict) -> tuple[str, str]:
         cls = "ok"
     elif s in ("preparing", "in_progress", "open", "accepted"):
         cls = "warn"
-    elif s in ("failed", "canceled", "cancelled", "rejected", "error"):
+    elif s in ("failed", "canceled", "cancelled", "rejected", "error", "pos_failed"):
         cls = "bad"
     else:
         cls = ""
@@ -298,9 +314,11 @@ def _page(deps: PortalDeps, tenant: Tenant, active: str, title: str, body: str) 
     now = time.time()
     live = sum(1 for c in deps.tenants.list_calls(tenant.id, 50) if _is_live(c, now))
     label, connected, _ = _pos_state(deps, tenant)
+    role = _viewer_role.get()
     return ui.shell(
         title=title, body=body, tenant_name=tenant.name, active=active,
         platform=deps.platform_name, live_calls=live,
+        visible={k for k, perm in _NAV_PERMISSION.items() if rbac.can(role, perm)},
         status_label="Live workspace" if connected else "Setup needed",
         status_ok=connected,
     )
@@ -588,6 +606,364 @@ def _orders_page(deps: PortalDeps, tenant: Tenant) -> str:
     return _page(deps, tenant, "orders", "Orders", body)
 
 
+# --- AI phone answering (PR 2) ------------------------------------------------------
+_OFF_ACTION_LABELS = {"transfer": "Forward to staff", "voicemail": "Take a voicemail",
+                      "message": "Play a closed message"}
+_NO_ANSWER_LABELS = {"voicemail": "Take a voicemail", "message": "Play the closed message"}
+
+
+def _hhmm(minute: int) -> str:
+    return f"{minute // 60:02d}:{minute % 60:02d}"
+
+
+def _parse_hhmm(text: str) -> int:
+    h, _, m = str(text).partition(":")
+    value = int(h) * 60 + int(m)
+    if not 0 <= value < 1440:
+        raise ValueError
+    return value
+
+
+def _routing_view(deps: PortalDeps, tenant: Tenant) -> dict:
+    """Everything the AI phone page shows, incl. what happens to a call right now."""
+    tz, now = _tz(tenant), time.time()
+    enabled = deps.tenants.flag_enabled(tenant.id, "voice_schedule_enabled")
+    cfg, version = deps.tenants.routing_config(tenant.id, now)
+    decision = (routing.evaluate(cfg, now, tz, deps.tenants.platform_emergency()) if enabled
+                else routing.Decision(True, "AI phone controls are off: the AI answers every call"))
+    real_transfer = real_transfer_number(tenant.setting("transfer_number", ""))
+    return {
+        "enabled": enabled, "version": version, "mode": cfg.mode,
+        "off_action": cfg.off_action, "no_answer_action": cfg.no_answer_action,
+        "closed_message": cfg.closed_message, "emergency_off": cfg.emergency_off,
+        "windows": [{"day": w.day, "start": _hhmm(w.start_min), "end": _hhmm(w.end_min)}
+                    for w in cfg.windows],
+        "overrides": [{"id": o.id, "kind": o.kind, "ai_on": o.ai_on, "reason": o.reason,
+                       "starts_at": o.starts_at, "ends_at": o.ends_at,
+                       "active": o.starts_at <= now and (o.ends_at is None or now < o.ends_at)}
+                      for o in cfg.overrides if o.ends_at is None or o.ends_at > now],
+        "effective": {"ai": decision.ai, "reason": decision.reason,
+                      "next_change_at": decision.next_change_at},
+        "transfer_number": real_transfer, "timezone": tenant.setting("timezone", ""),
+    }
+
+
+_PHONE_JS = r"""
+const DATA = __DATA__;
+const DAYS = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+const $ = s => document.querySelector(s);
+function msg(kind, text){ const m=$('#phone-msg'); m.innerHTML='<div class="alert '+kind+'"></div>'; m.firstChild.textContent=text; m.scrollIntoView({block:'nearest'}); }
+async function call(url, method, body){
+  const r = await fetch(url, {method, headers:{'Content-Type':'application/json'}, body: body?JSON.stringify(body):undefined});
+  const j = await r.json().catch(()=>({}));
+  if(!r.ok || j.ok===false){ msg('bad', j.error || j.detail || ('Failed ('+r.status+')')); return null; }
+  return j;
+}
+function winRow(day, w){
+  const row=document.createElement('div'); row.className='win';
+  row.innerHTML='<input type="time" class="ws" required> <span class="mut">to</span> <input type="time" class="we" required>'+
+    '<span class="mut small over" hidden>(ends next day)</span><button type="button" class="linkbtn rm">Remove</button>';
+  row.querySelector('.ws').value=w.start; row.querySelector('.we').value=w.end;
+  const upd=()=>{ row.querySelector('.over').hidden=!(row.querySelector('.we').value<=row.querySelector('.ws').value); };
+  row.querySelectorAll('input').forEach(i=>i.addEventListener('input',upd)); upd();
+  row.querySelector('.rm').onclick=()=>row.remove();
+  return row;
+}
+function renderSchedule(){
+  const g=$('#sched'); g.innerHTML='';
+  DAYS.forEach((name,day)=>{
+    const d=document.createElement('div'); d.className='day'; d.textContent=name;
+    const box=document.createElement('div'); box.className='wins'; box.dataset.day=day;
+    DATA.windows.filter(w=>w.day===day).forEach(w=>box.appendChild(winRow(day,w)));
+    const add=document.createElement('button'); add.type='button'; add.className='linkbtn'; add.textContent='+ Add hours';
+    add.onclick=()=>box.insertBefore(winRow(day,{start:'11:00',end:'21:00'}), add);
+    box.appendChild(add); g.append(d, box);
+  });
+}
+function collectWindows(){
+  const out=[];
+  document.querySelectorAll('#sched .wins').forEach(box=>box.querySelectorAll('.win').forEach(r=>{
+    out.push({day:+box.dataset.day, start:r.querySelector('.ws').value, end:r.querySelector('.we').value});
+  }));
+  return out;
+}
+function syncVisibility(){
+  const mode=document.querySelector('input[name=mode]:checked').value;
+  $('#sched-card').hidden = mode!=='scheduled';
+  const off=$('#off_action').value;
+  $('#no-answer-row').hidden = off!=='transfer';
+  $('#controls').classList.toggle('dim', !$('#enabled').checked);
+}
+$('#copy-mon').onclick=()=>{
+  const mon=[...document.querySelectorAll('#sched .wins[data-day="0"] .win')].map(r=>({start:r.querySelector('.ws').value,end:r.querySelector('.we').value}));
+  DATA.windows=[]; for(let d=0;d<7;d++) mon.forEach(w=>DATA.windows.push({day:d,...w})); renderSchedule();
+};
+document.querySelectorAll('input[name=mode], #off_action, #enabled').forEach(e=>e.addEventListener('change',syncVisibility));
+$('#routing-form').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const body={enabled:$('#enabled').checked, mode:document.querySelector('input[name=mode]:checked').value,
+    off_action:$('#off_action').value, no_answer_action:$('#no_answer_action').value,
+    closed_message:$('#closed_message').value, windows:collectWindows(), expected_version:DATA.version};
+  if(body.enabled && body.mode==='scheduled' && !body.windows.length){ msg('bad','Add at least one time window, or choose Always on.'); return; }
+  if(await call('/portal/api/voice-routing','PUT',body)) location.href='/portal/phone?saved=1';
+});
+document.querySelectorAll('[data-pause]').forEach(b=>b.onclick=async()=>{
+  if(await call('/portal/api/voice-routing/pause','POST',{until:b.dataset.pause})) location.reload();
+});
+const resume=$('#resume'); if(resume) resume.onclick=async()=>{ if(await call('/portal/api/voice-routing/resume','POST',{})) location.reload(); };
+const stop=$('#stop'); if(stop) stop.onclick=async()=>{
+  if(confirm('Turn the AI off now? New calls follow your "when the AI is off" choice until you resume.') &&
+     await call('/portal/api/voice-routing/stop','POST',{})) location.reload();
+};
+$('#exc-form').addEventListener('submit', async e=>{
+  e.preventDefault();
+  const body={from:$('#exc-from').value, to:$('#exc-to').value||$('#exc-from').value,
+              ai_on:$('#exc-ai').value==='on', reason:$('#exc-reason').value};
+  if(await call('/portal/api/voice-routing/exceptions','POST',body)) location.reload();
+});
+document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=async()=>{
+  if(await call('/portal/api/voice-routing/exceptions/'+encodeURIComponent(b.dataset.cancel),'DELETE')) location.reload();
+});
+renderSchedule(); syncVisibility();
+"""
+
+
+def _phone_page(deps: PortalDeps, tenant: Tenant, saved: bool = False) -> str:
+    tz = _tz(tenant)
+    v = _routing_view(deps, tenant)
+    eff = v["effective"]
+    nxt = ""
+    if v["enabled"] and eff["next_change_at"]:
+        nxt = (f"Next change: AI {'off' if eff['ai'] else 'on'} at "
+               f"{_clock(eff['next_change_at'], tz, 'datetime')}.")
+    if not v["enabled"]:
+        state = "AI answers every call"
+    elif eff["ai"]:
+        state = "AI is answering calls"
+    else:
+        state = {"transfer": "AI is off: calls are forwarded to staff",
+                 "voicemail": "AI is off: callers can leave a voicemail",
+                 "message": "AI is off: callers hear your closed message"}[v["off_action"]]
+    paused = v["emergency_off"] or any(o["active"] and o["kind"] == "pause" for o in v["overrides"])
+    buttons = ""
+    if v["enabled"]:
+        if paused:
+            buttons = f'<button class="btn" id="resume" type="button">{icon("play", 16)}Resume AI</button>'
+        else:
+            buttons = ('<button class="btn ghost sm" type="button" data-pause="1h">Pause 1 hour</button>'
+                       '<button class="btn ghost sm" type="button" data-pause="midnight">Pause until midnight</button>'
+                       '<button class="btn ghost sm" type="button" data-pause="resume">Pause until I resume</button>'
+                       '<button class="btn ghost sm" type="button" id="stop" style="color:var(--bad)">Turn AI off now</button>')
+    status = f"""<div class="card kpi {'ok' if eff['ai'] else 'warn'}" style="min-height:0;margin-bottom:32px">
+<div class="state"><span class="dot {'' if eff['ai'] else 'warn'}"></span><span class="big">{_e(state)}</span></div>
+<p style="margin:10px 0 0">{_e(eff['reason'])}. {nxt}</p>
+{f'<div class="actions" style="margin-top:20px">{buttons}</div>' if buttons else ''}</div>"""
+
+    if v["transfer_number"]:
+        transfer_note = f"Forwards to <b>{_e(_phone_display(normalize_number(v['transfer_number'])))}</b>, rings for 20 seconds."
+    else:
+        transfer_note = ("<span class='amber'>No staff number set yet</span>, so forwarded calls go straight to "
+                         "the fallback below. <a href='/portal/settings'>Set the transfer number</a>.")
+    mode_opts = "".join(
+        f'<label><input type="radio" name="mode" value="{m}"{" checked" if v["mode"] == m else ""}>{l}</label>'
+        for m, l in (("always_on", "Always on"), ("scheduled", "On a schedule"), ("always_off", "Always off")))
+    off_opts = "".join(f'<option value="{k}"{" selected" if v["off_action"] == k else ""}>{l}</option>'
+                       for k, l in _OFF_ACTION_LABELS.items())
+    na_opts = "".join(f'<option value="{k}"{" selected" if v["no_answer_action"] == k else ""}>{l}</option>'
+                      for k, l in _NO_ANSWER_LABELS.items())
+    def when(o: dict) -> str:
+        if o["kind"] == "exception" and o["ends_at"]:  # whole local days
+            first = _dt(o["starts_at"], tz).strftime("%b %d")
+            last = _dt(o["ends_at"] - 1, tz).strftime("%b %d")
+            return first if first == last else f"{first} – {last}"
+        end = _clock(o["ends_at"], tz, "datetime") if o["ends_at"] else "until resumed"
+        return f"{_clock(o['starts_at'], tz, 'datetime')} → {end}"
+    exc_rows = "".join(
+        f"<div class='rank' style='align-items:center;padding:16px 0'><div><b>{when(o)}</b>"
+        f"<div class='mut small'>{_e(o['reason']) or ('Pause' if o['kind'] == 'pause' else 'Exception')}</div></div>"
+        f"<div style='display:flex;gap:14px;align-items:center'>"
+        f"<span class='pill {'ok' if o['ai_on'] else 'warn'}'>AI {'on' if o['ai_on'] else 'off'}</span>"
+        f"<button class='linkbtn rm' type='button' data-cancel='{_e(o['id'])}'>Cancel</button></div></div>"
+        for o in v["overrides"])
+    zone = dict(TIMEZONES).get(v["timezone"], "the server's clock (set a time zone in System settings)")
+    body = _page_head("AI phone answering",
+                      "Choose when the AI answers your calls, and what callers get when it doesn't.") + f"""
+{'<div class="alert ok">Saved.</div>' if saved else ''}<div id=phone-msg></div>{status}
+<div class="grid-main" style="align-items:start"><form id="routing-form" class="stack" style="gap:28px">
+<label class="switch"><input type="checkbox" id="enabled"{' checked' if v['enabled'] else ''}>
+Use AI phone controls <span class="mut small" style="font-weight:400">(off = the AI answers every call, as before)</span></label>
+<div id="controls" class="stack" style="gap:28px">
+<div><h3 class="sec-h" style="margin-bottom:10px">When should the AI answer?</h3>
+<div class="choice">{mode_opts}</div></div>
+<div class="card" id="sched-card"><div class="card-h"><h3>Weekly schedule</h3>
+<span class="r mut small">Times in {_e(zone)}</span></div>
+<div class="card-b"><div class="sched" id="sched"></div>
+<button class="btn ghost sm" type="button" id="copy-mon" style="margin-top:18px">Copy Monday to every day</button></div></div>
+<div><h3 class="sec-h" style="margin-bottom:10px">When the AI is off</h3>
+<select id="off_action">{off_opts}</select><p class="help">{transfer_note}</p>
+<div id="no-answer-row"><label class="f">If staff don't answer or the line is busy</label>
+<select id="no_answer_action">{na_opts}</select></div>
+<label class="f">Closed message</label>
+<textarea id="closed_message" maxlength="500" style="min-height:90px"
+ placeholder="Thanks for calling {_e(tenant.name)}. We can't take your call right now. Please call back during our opening hours.">{_e(v['closed_message'])}</textarea>
+</div></div>
+<div class="actions" style="margin-top:0"><button class="btn" type="submit">{icon("save", 18)}Save</button></div>
+</form>
+<div><h3 class="sec-h">Holidays &amp; exceptions</h3>
+<p class="mut small" style="margin-top:-10px">Override the schedule for whole days, e.g. AI off on a holiday.</p>
+<div class="card"><div class="card-b" style="padding-top:4px;padding-bottom:4px">{exc_rows or '<p class="mut">No upcoming exceptions.</p>'}</div></div>
+<form id="exc-form" class="card card-b" style="margin-top:20px">
+<h3 class="sec-h" style="margin-bottom:6px;font-size:17px">Add an exception</h3>
+<label class="f" style="margin-top:12px">From</label><input type="date" id="exc-from" required>
+<label class="f" style="margin-top:12px">To <span class="mut small">(optional)</span></label><input type="date" id="exc-to">
+<label class="f" style="margin-top:12px">AI</label>
+<select id="exc-ai"><option value="off">Off all day</option><option value="on">On all day</option></select>
+<input id="exc-reason" maxlength="120" placeholder="Reason, e.g. Thanksgiving" style="margin-top:12px">
+<div class="actions" style="margin-top:16px"><button class="btn ghost" type="submit">Add exception</button></div></form>
+</div></div>
+<style>#controls.dim{{opacity:.45;pointer-events:none}}</style>
+<script>{_PHONE_JS.replace("__DATA__", json.dumps(v))}</script>"""
+    return _page(deps, tenant, "phone", "AI phone", body)
+
+
+# --- Kitchen approvals (PR 3) ----------------------------------------------------------
+_CATEGORY_LABELS = {"custom_modification": "Custom change", "allergy": "Allergy",
+                    "availability": "Availability", "large_order": "Large order", "other": "Other"}
+
+
+def _approval_view(deps: PortalDeps, tenant: Tenant, a: dict, now: float) -> dict:
+    """What the kitchen sees: no customer phone numbers or names."""
+    call = deps.tenants.get_transcript(tenant.id, a["call_sid"]) or {}
+    live = call.get("status") == "live" and now - (call.get("updated_at") or 0) < _LIVE_STALE_SECONDS
+    return {"id": a["id"], "status": a["status"], "category": a["category"],
+            "category_label": _CATEGORY_LABELS.get(a["category"], a["category"]),
+            "item_name": a["item_name"], "request": a["request_text"], "note": a["decision_note"],
+            "version": a["version"], "seconds_left": max(0, int(a["deadline_at"] - now)),
+            "created_at": a["created_at"], "decided_at": a["decided_at"], "caller_on_line": live}
+
+
+_KITCHEN_JS = r"""
+const $ = s => document.querySelector(s);
+function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':String(s); return d.innerHTML; }
+let known = new Set(), first = true, sound = false, ctx = null;
+try { sound = localStorage.getItem('vo_kitchen_sound') === '1'; } catch(e) {}
+const sb = $('#sound'); sb.checked = sound;
+sb.onchange = () => { sound = sb.checked; try { localStorage.setItem('vo_kitchen_sound', sound?'1':'0'); } catch(e) {} if (sound) beep(); };
+function beep(){
+  try { ctx = ctx || new (window.AudioContext||window.webkitAudioContext)();
+    [0, .25].forEach(t => { const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880;
+      g.gain.setValueAtTime(.25, ctx.currentTime+t); g.gain.exponentialRampToValueAtTime(.001, ctx.currentTime+t+.2);
+      o.connect(g); g.connect(ctx.destination); o.start(ctx.currentTime+t); o.stop(ctx.currentTime+t+.22); });
+  } catch(e) {}
+}
+function card(a){
+  const allergy = a.category === 'allergy';
+  return `<div class="req ${allergy?'allergy':''}" data-id="${esc(a.id)}">
+   <div class="req-top"><span class="pill ${allergy?'bad':'warn'}">${esc(a.category_label)}</span>
+   ${a.item_name?`<b>${esc(a.item_name)}</b>`:''}
+   <span class="mut small">${a.caller_on_line?'Caller on hold':'Caller left the line'}</span>
+   <span class="left ${a.seconds_left<=15?'low':''}" data-left="${a.seconds_left}">${a.seconds_left}s left</span></div>
+   <div class="what">${esc(a.request)}</div>
+   ${allergy?'<p class="small" style="color:var(--bad);margin:4px 0 0">Allergy: a note is required. Approving is not an allergen-safety guarantee.</p>':''}
+   <input class="note" maxlength="300" placeholder="${allergy?'Note for the caller (required)':'Note for the caller (optional)'}" style="margin-top:12px">
+   <div class="acts"><button class="btn" data-d="approved">Approve</button>
+   <button class="btn bad" data-d="rejected">Reject</button>
+   <button class="btn ghost" data-d="needs_info">Need more info</button></div></div>`;
+}
+async function decide(el, decision){
+  const id = el.dataset.id, a = window._pending[id];
+  const note = el.querySelector('.note').value.trim();
+  el.querySelectorAll('button').forEach(b => b.disabled = true);
+  const r = await fetch('/portal/api/approvals/'+encodeURIComponent(id)+'/decision', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({decision, note, expected_version: a.version})});
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) {
+    el.querySelectorAll('button').forEach(b => b.disabled = false);
+    el.querySelectorAll('.alert').forEach(x => x.remove());
+    const m = document.createElement('div'); m.className='alert bad'; m.textContent = j.detail || j.error || 'Could not save';
+    el.appendChild(m); el.dataset.hold = Date.now() + 5000;  // keep the card (and message) on screen
+    if (r.status === 409) setTimeout(load, 1500);
+    return;
+  }
+  load();
+}
+async function load(){
+  const r = await fetch('/portal/api/approvals'); if (!r.ok) return;
+  const j = await r.json();
+  window._pending = Object.fromEntries(j.pending.map(a => [a.id, a]));
+  const box = $('#pending');
+  // Keep cards someone is typing in; rebuild the rest.
+  const typing = document.activeElement && document.activeElement.classList.contains('note') ? document.activeElement.closest('.req') : null;
+  const showingError = [...document.querySelectorAll('.req')].some(c => +(c.dataset.hold || 0) > Date.now());
+  if (!typing && !showingError) {
+    box.innerHTML = j.pending.length ? j.pending.map(card).join('') : '<div class="card"><div class="empty">No requests right now. New ones appear here instantly.</div></div>';
+    box.querySelectorAll('.req').forEach(el => el.querySelectorAll('[data-d]').forEach(b => b.onclick = () => decide(el, b.dataset.d)));
+  }
+  const fresh = j.pending.filter(a => !known.has(a.id));
+  if (!first && fresh.length && sound) beep();
+  j.pending.forEach(a => known.add(a.id)); first = false;
+  $('#count').textContent = j.pending.length;
+  $('#recent').innerHTML = j.recent.map(a => `<div class="rank" style="padding:14px 0;align-items:center;gap:14px"><div><b>${esc(a.request)}</b>
+    <div class="mut small">${esc(a.category_label)}${a.note?' · “'+esc(a.note)+'”':''}</div></div>
+    <span class="pill ${a.status==='approved'?'ok':a.status==='rejected'?'bad':''}">${esc(a.status.replace('_',' '))}</span></div>`).join('')
+    || '<p class="mut">Nothing yet.</p>';
+}
+setInterval(() => document.querySelectorAll('[data-left]').forEach(e => {
+  const v = Math.max(0, +e.dataset.left - 1); e.dataset.left = v; e.textContent = v + 's left'; e.classList.toggle('low', v <= 15); }), 1000);
+load(); setInterval(load, 2000);
+"""
+
+_KITCHEN_SETTINGS_JS = r"""
+document.getElementById('hitl-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {enabled: f.enabled.checked, hold_seconds: +f.hold_seconds.value,
+                large_order_total: +(f.large_order_total.value || 0), on_timeout: f.on_timeout.value};
+  const r = await fetch('/portal/api/approvals/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json().catch(()=>({}));
+  const m = document.getElementById('hitl-msg'); m.innerHTML = '<div class="alert ' + (r.ok?'ok':'bad') + '"></div>';
+  m.firstChild.textContent = r.ok ? 'Saved.' : (j.error || 'Save failed');
+});
+"""
+
+
+def _kitchen_page(deps: PortalDeps, tenant: Tenant) -> str:
+    enabled = deps.tenants.flag_enabled(tenant.id, "hitl_enabled")
+    settings_card = ""
+    if rbac.can(_viewer_role.get(), "settings.edit"):
+        pol = hitl.ApprovalPolicy.from_settings(tenant.settings)
+        timeout_opts = "".join(
+            f'<option value="{k}"{" selected" if pol.on_timeout == k else ""}>{l}</option>'
+            for k, l in (("offer_transfer", "Offer to transfer to staff, drop the request, or continue"),
+                         ("drop_request", "Continue the order without the request")))
+        settings_card = f"""<form id="hitl-form" class="card card-b" style="margin-top:28px">
+<h3 class="sec-h" style="margin-bottom:6px">Approval settings</h3><div id="hitl-msg"></div>
+<label class="switch" style="margin-top:10px"><input type="checkbox" name="enabled"{' checked' if enabled else ''}>
+Ask the kitchen during calls</label>
+<label class="f" style="margin-top:16px">Hold time (seconds)</label>
+<input type="number" name="hold_seconds" min="20" max="180" value="{pol.hold_seconds}">
+<p class="help">How long a caller waits for an answer. No answer is never treated as a yes.</p>
+<label class="f" style="margin-top:16px">Large orders need approval above ($)</label>
+<input type="number" name="large_order_total" min="0" step="1" value="{pol.large_order_total:g}" placeholder="0 = never">
+<label class="f" style="margin-top:16px">If the kitchen doesn't answer in time</label>
+<select name="on_timeout">{timeout_opts}</select>
+<div class="actions" style="margin-top:18px"><button class="btn ghost" type="submit">{icon("save", 18)}Save</button></div></form>
+<script>{_KITCHEN_SETTINGS_JS}</script>"""
+    off_note = ("" if enabled else
+                '<div class="alert warn">Kitchen approvals are off, so the AI won\'t send requests here yet. '
+                + ("Turn them on in Approval settings below.</div>" if settings_card else "Ask your admin to turn them on.</div>"))
+    body = _page_head("Kitchen", "Requests the AI needs a person to confirm while the caller holds.") + f"""
+{off_note}
+<div class="grid-main"><div><div class="row-between" style="margin-bottom:16px">
+<h3 class="sec-h" style="margin:0">Waiting for you <span class="pill warn" id="count">0</span></h3>
+<label class="switch small"><input type="checkbox" id="sound"> Sound alert</label></div>
+<div id="pending"><div class="card"><div class="empty">Loading…</div></div></div></div>
+<div><h3 class="sec-h">Recent decisions</h3><div class="card"><div class="card-b" id="recent"
+ style="padding-top:4px;padding-bottom:4px"></div></div>{settings_card}</div></div>
+<script>{_KITCHEN_JS}</script>"""
+    return _page(deps, tenant, "kitchen", "Kitchen", body)
+
+
 def _customers_page(deps: PortalDeps, tenant: Tenant) -> str:
     tz, now = _tz(tenant), time.time()
     customers = deps.tenants.list_customers(tenant.id, 500)
@@ -873,13 +1249,25 @@ load();
 
 _CALLS_JS = """
 function esc(s) { const d = document.createElement('div'); d.textContent = s == null ? '' : String(s); return d.innerHTML; }
+function handled(c) {
+  const m = c.meta || {}, r = m.route || 'ai';
+  const tr = m.transfer_result ? ' (' + (m.transfer_result === 'completed' ? 'answered' : esc(m.transfer_result)) + ')' : '';
+  if (r === 'voicemail') return m.voicemail_url
+    ? `<a href="${esc(m.voicemail_url)}.mp3" target="_blank" rel="noopener">▶ Voicemail${m.voicemail_seconds ? ' ' + m.voicemail_seconds + 's' : ''}</a>`
+    : '<span class="mut">Voicemail (none left)</span>';
+  if (r === 'forwarded') return 'Forwarded to staff' + tr;
+  if (r === 'ai_transfer') return 'AI → staff' + tr;
+  if (r === 'closed') return '<span class="mut">Closed message</span>';
+  if (r === 'ai_off') return '<span class="mut">AI off</span>';
+  return 'AI';
+}
 function dur(c) { const s = Math.max(0, Math.round(c.updated_at - c.started_at)); return s >= 60 ? Math.floor(s/60) + 'm ' + String(s%60).padStart(2,'0') + 's' : s + 's'; }
 async function load() {
   const r = await fetch('/portal/api/calls'); if (!r.ok) return;
   const j = await r.json();
   const tb = document.getElementById('rows');
   const now = Date.now() / 1000;
-  if (!j.calls.length) { tb.innerHTML = '<tr><td colspan=6 class="mut">No calls yet. They appear here the moment a customer phones in.</td></tr>'; return; }
+  if (!j.calls.length) { tb.innerHTML = '<tr><td colspan=7 class="mut">No calls yet. They appear here the moment a customer phones in.</td></tr>'; return; }
   tb.innerHTML = j.calls.map(c => {
     const live = c.status === 'live' && now - c.updated_at < __STALE__;
     return `<tr>
@@ -887,6 +1275,7 @@ async function load() {
     <td><b>${esc(c.from_number || 'Unknown caller')}</b></td>
     <td class="mut">${new Date(c.started_at*1000).toLocaleString([], {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'})}</td>
     <td class="mut">${live ? '—' : dur(c)}</td>
+    <td>${handled(c)}</td>
     <td>${c.turn_count}</td>
     <td><a href="/portal/calls/${encodeURIComponent(c.call_sid)}">${live ? 'Listen in' : 'Details'}</a></td></tr>`;
   }).join('');
@@ -898,8 +1287,8 @@ load(); setInterval(load, 3000);
 def _calls_page(deps: PortalDeps, tenant: Tenant) -> str:
     body = _page_head("Live calls", "Every call the AI answers, live and recent. Updates every few seconds.") + """
 <div class="card"><div class="tbl-wrap"><table><thead><tr><th>Status</th><th>Caller</th><th>Started</th>
-<th>Length</th><th>Turns</th><th></th></tr></thead>
-<tbody id=rows><tr><td colspan=6 class="mut">Loading…</td></tr></tbody></table></div></div>
+<th>Length</th><th>Handled by</th><th>Turns</th><th></th></tr></thead>
+<tbody id=rows><tr><td colspan=7 class="mut">Loading…</td></tr></tbody></table></div></div>
 <script>""" + _CALLS_JS.replace("__STALE__", str(_LIVE_STALE_SECONDS)) + "</script>"
     return _page(deps, tenant, "calls", "Live calls", body)
 
@@ -907,6 +1296,7 @@ def _calls_page(deps: PortalDeps, tenant: Tenant) -> str:
 def _call_detail_page(deps: PortalDeps, tenant: Tenant, call_sid: str) -> str:
     body = f"""<p style="margin:0 0 20px"><a href="/portal/calls">{icon("back", 16)} All calls</a></p>
 <div class="page-h"><div><h2>Call transcript</h2><p id=head>Loading…</p></div></div>
+<div id=route-note></div>
 <div class="card"><div class="card-b" id=turns></div></div>
 <script>
 const SID = {json.dumps(call_sid)};
@@ -919,6 +1309,15 @@ async function load() {{
     `<span class="pill ${{j.status==='live'?'ok':''}}">${{esc(j.status)}}</span>
      &nbsp;From ${{esc(j.from_number||'unknown caller')}} · started
      ${{new Date(j.started_at*1000).toLocaleString()}}`;
+  const m = j.meta || {{}};
+  const note = document.getElementById('route-note');
+  if (m.route && m.route !== 'ai' && !note.dataset.done) {{
+    note.dataset.done = '1';
+    const why = m.reason ? ' — ' + m.reason : '';
+    note.innerHTML = m.voicemail_url
+      ? `<div class="alert"><b>Voicemail</b>${{esc(why)}}<audio controls preload="none" style="display:block;margin-top:10px;width:100%" src="${{esc(m.voicemail_url)}}.mp3"></audio></div>`
+      : `<div class="alert">Handled without the AI: <b>${{esc(m.route.replace('_', ' '))}}</b>${{esc(why)}}${{m.transfer_result ? ' · transfer ' + esc(m.transfer_result) : ''}}</div>`;
+  }}
   const el = document.getElementById('turns');
   el.innerHTML = j.turns.length ? j.turns.map(t => `
     <div class="bubble caller"><div class=w>Caller · ${{new Date(t.ts*1000).toLocaleTimeString()}}</div>
@@ -1106,18 +1505,42 @@ def _session_user(request: Request, deps: PortalDeps) -> PortalUser | None:
     return user
 
 
-def _set_login_cookie(resp: RedirectResponse, user: PortalUser) -> None:
+def session_user(request: Request, tenants: TenantStore) -> PortalUser | None:
+    """The signed-in portal user, for other routers (e.g. the legacy /owner pages)."""
+    raw = request.cookies.get(COOKIE_NAME, "")
+    data = crypto.read_session_cookie(raw) if raw else None
+    if not data:
+        return None
+    user = tenants.get_user(data.get("uid", ""))
+    return user if user and user.tenant_id == data.get("tid") else None
+
+
+def is_https(request: Request) -> bool:
+    """True when the visitor reached us over HTTPS (Render terminates TLS at its
+    proxy and says so in X-Forwarded-Proto)."""
+    forwarded = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
+    return request.url.scheme == "https" or forwarded == "https"
+
+
+# Portal login lockout: email -> recent failure times.
+_FAILED_LOGINS: dict[str, list[float]] = {}
+_MAX_FAILURES, _FAILURE_WINDOW = 5, 15 * 60
+
+
+def _set_login_cookie(resp: RedirectResponse, user: PortalUser, secure: bool = False) -> None:
     resp.set_cookie(
         COOKIE_NAME,
         crypto.make_session_cookie({"uid": user.id, "tid": user.tenant_id}),
-        max_age=86400 * 7, httponly=True, samesite="lax", path="/",
+        max_age=86400 * 7, httponly=True, samesite="lax", path="/", secure=secure,
     )
 
 
 def build_portal_router(deps: PortalDeps) -> APIRouter:
     router = APIRouter()
 
-    def page_user(request: Request) -> tuple[PortalUser, Tenant] | RedirectResponse:
+    def page_user(request: Request, permission: str) -> tuple[PortalUser, Tenant] | RedirectResponse:
+        """Signed-in user allowed `permission`, else a redirect (login, or the
+        first page their role may open)."""
         user = _session_user(request, deps)
         if not user:
             return RedirectResponse("/portal/login", status_code=302)
@@ -1126,38 +1549,57 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             r = RedirectResponse("/portal/login", status_code=302)
             r.delete_cookie(COOKIE_NAME, path="/")
             return r
+        if not rbac.can(user.role, permission):
+            home = rbac.home_page(user.role)
+            # Never bounce a user back to the page they were refused.
+            return RedirectResponse(home if home != request.url.path else "/portal/logout",
+                                    status_code=302)
+        _viewer_role.set(user.role)
         return user, tenant
 
-    def api_user(request: Request) -> tuple[PortalUser, Tenant]:
+    def api_user(request: Request, permission: str) -> tuple[PortalUser, Tenant]:
         user = _session_user(request, deps)
         if not user:
             raise HTTPException(status_code=401, detail="login required")
         tenant = deps.tenants.get_tenant(user.tenant_id)
         if not tenant:
             raise HTTPException(status_code=401, detail="login required")
+        if not rbac.can(user.role, permission):
+            raise HTTPException(status_code=403, detail="your role can't do that")
         return user, tenant
 
     # -- auth pages ------------------------------------------------------
     @router.get("/portal/login", response_class=HTMLResponse)
     async def login_page(request: Request):
-        if _session_user(request, deps):
-            return RedirectResponse("/portal/", status_code=302)
+        current = _session_user(request, deps)
+        if current:
+            return RedirectResponse(rbac.home_page(current.role), status_code=302)
         return _login_page(deps.platform_name, signup=deps.signup_enabled)
 
     @router.post("/portal/login")
     async def login_post(request: Request):
         form = await request.form()
-        user = deps.tenants.verify_user(
-            str(form.get("email", "")), str(form.get("password", ""))
-        )
+        email = str(form.get("email", "")).strip().lower()
+        now = time.time()
+        recent = [t for t in _FAILED_LOGINS.get(email, []) if now - t < _FAILURE_WINDOW]
+        if len(recent) >= _MAX_FAILURES:
+            if len(recent) == _MAX_FAILURES:  # audit the lockout once, not every attempt
+                deps.tenants.audit("user", email, None, "portal.login_locked", "portal")
+                _FAILED_LOGINS[email] = recent + [now]
+            return HTMLResponse(
+                _login_page(deps.platform_name, "Too many attempts. Try again in 15 minutes.",
+                            signup=deps.signup_enabled), status_code=429)
+        user = deps.tenants.verify_user(email, str(form.get("password", "")))
         if not user:
+            _FAILED_LOGINS[email] = recent + [now]
             return HTMLResponse(
                 _login_page(deps.platform_name, "Invalid email or password.",
                             signup=deps.signup_enabled),
                 status_code=401,
             )
-        resp = RedirectResponse("/portal/", status_code=302)
-        _set_login_cookie(resp, user)
+        _FAILED_LOGINS.pop(email, None)
+        resp = RedirectResponse(rbac.home_page(user.role), status_code=302)
+        _set_login_cookie(resp, user, secure=is_https(request))
         return resp
 
     @router.get("/portal/signup", response_class=HTMLResponse)
@@ -1200,8 +1642,10 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             return HTMLResponse(_signup_page(deps.platform_name, str(exc)),
                                 status_code=400)
         tenant = deps.tenants.get_tenant(tenant.id)
+        deps.tenants.audit("user", user.id, tenant.id, "account.signup", f"user:{user.id}",
+                           None, {"restaurant": tenant.name, "email": user.email, "role": user.role})
         resp = RedirectResponse("/portal/pos", status_code=302)
-        _set_login_cookie(resp, user)
+        _set_login_cookie(resp, user, secure=is_https(request))
         log.info("portal signup: tenant %s (%s)", tenant.id, tenant.name)
         return resp
 
@@ -1214,7 +1658,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
     # -- pages -----------------------------------------------------------
     @router.get("/portal/", response_class=HTMLResponse)
     async def dashboard(request: Request):
-        res = page_user(request)
+        res = page_user(request, "reports.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1222,7 +1666,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/statistics", response_class=HTMLResponse)
     async def statistics_page(request: Request, days: int = 7):
-        res = page_user(request)
+        res = page_user(request, "reports.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1230,15 +1674,177 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/orders", response_class=HTMLResponse)
     async def orders_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "orders.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
         return _orders_page(deps, tenant)
 
+    @router.get("/portal/phone", response_class=HTMLResponse)
+    async def phone_page(request: Request, saved: int = 0):
+        res = page_user(request, "settings.edit")
+        if isinstance(res, RedirectResponse):
+            return res
+        _, tenant = res
+        return _phone_page(deps, tenant, saved=bool(saved))
+
+    @router.get("/portal/api/voice-routing")
+    async def api_routing_get(request: Request):
+        _, tenant = api_user(request, "settings.edit")
+        return _routing_view(deps, tenant)
+
+    @router.put("/portal/api/voice-routing")
+    async def api_routing_put(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        body = await request.json()
+        try:
+            windows = [routing.Window(int(w["day"]), _parse_hhmm(w["start"]), _parse_hhmm(w["end"]))
+                       for w in body.get("windows") or []]
+            cfg = routing.RoutingConfig(
+                mode=str(body.get("mode", "always_on")), off_action=str(body.get("off_action", "transfer")),
+                no_answer_action=str(body.get("no_answer_action", "voicemail")),
+                closed_message=str(body.get("closed_message", "")), windows=windows)
+            expected = body.get("expected_version")
+            deps.tenants.save_routing(tenant.id, cfg, user.id,
+                                      expected_version=int(expected) if expected is not None else None)
+        except (KeyError, TypeError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc) or "invalid schedule"}, status_code=400)
+        enabled = bool(body.get("enabled"))
+        if enabled != deps.tenants.flag_enabled(tenant.id, "voice_schedule_enabled"):
+            deps.tenants.set_flag(tenant.id, "voice_schedule_enabled", enabled, actor=user.id)
+        return {"ok": True}
+
+    @router.post("/portal/api/voice-routing/pause")
+    async def api_routing_pause(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        until = str((await request.json()).get("until", ""))
+        now = time.time()
+        if until == "1h":
+            ends = now + 3600
+        elif until == "midnight":
+            tz = _tz(tenant)
+            tomorrow = _dt(now, tz).date() + timedelta(days=1)
+            midnight = datetime(tomorrow.year, tomorrow.month, tomorrow.day)
+            ends = (midnight.replace(tzinfo=tz) if tz else midnight).timestamp()
+        elif until == "resume":
+            ends = None
+        else:
+            return JSONResponse({"ok": False, "error": "unknown pause length"}, status_code=400)
+        deps.tenants.add_routing_override(tenant.id, now, ends, ai_on=False, kind="pause",
+                                          reason="", actor=user.id)
+        return {"ok": True}
+
+    @router.post("/portal/api/voice-routing/resume")
+    async def api_routing_resume(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        deps.tenants.cancel_routing_overrides(tenant.id, user.id, kind="pause")
+        cfg, _ = deps.tenants.routing_config(tenant.id)
+        if cfg.emergency_off:
+            deps.tenants.set_routing_emergency(tenant.id, False, user.id)
+        return {"ok": True}
+
+    @router.post("/portal/api/voice-routing/stop")
+    async def api_routing_stop(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        deps.tenants.set_routing_emergency(tenant.id, True, user.id)
+        return {"ok": True}
+
+    @router.post("/portal/api/voice-routing/exceptions")
+    async def api_routing_exception(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        body = await request.json()
+        tz = _tz(tenant)
+        try:
+            first = datetime.strptime(str(body["from"]), "%Y-%m-%d")
+            last = datetime.strptime(str(body.get("to") or body["from"]), "%Y-%m-%d")
+            if last < first or (last - first).days > 60:
+                raise ValueError("pick an end date on or after the start, within 60 days")
+            start = (first.replace(tzinfo=tz) if tz else first).timestamp()
+            end_day = last + timedelta(days=1)
+            end = (end_day.replace(tzinfo=tz) if tz else end_day).timestamp()
+            deps.tenants.add_routing_override(tenant.id, start, end, ai_on=bool(body.get("ai_on")),
+                                              kind="exception", reason=str(body.get("reason", "")),
+                                              actor=user.id)
+        except (KeyError, ValueError) as exc:
+            return JSONResponse({"ok": False, "error": str(exc) or "invalid dates"}, status_code=400)
+        return {"ok": True}
+
+    @router.delete("/portal/api/voice-routing/exceptions/{override_id}")
+    async def api_routing_exception_cancel(request: Request, override_id: str):
+        user, tenant = api_user(request, "settings.edit")
+        if not deps.tenants.cancel_routing_overrides(tenant.id, user.id, override_id=override_id):
+            raise HTTPException(status_code=404, detail="exception not found")
+        return {"ok": True}
+
+    @router.get("/portal/kitchen", response_class=HTMLResponse)
+    async def kitchen_page(request: Request):
+        res = page_user(request, "approvals.decide")
+        if isinstance(res, RedirectResponse):
+            return res
+        _, tenant = res
+        return _kitchen_page(deps, tenant)
+
+    @router.get("/portal/api/approvals")
+    async def api_approvals(request: Request):
+        _, tenant = api_user(request, "approvals.decide")
+        now = time.time()
+        pending = deps.tenants.list_approvals(tenant.id, ("pending",), 50)
+        for a in pending:  # anything past its deadline is a timeout, not a pending request
+            if a["deadline_at"] <= now:
+                deps.tenants.expire_approval(tenant.id, a["id"], now=now)
+        pending = [a for a in deps.tenants.list_approvals(tenant.id, ("pending",), 50)]
+        recent = deps.tenants.list_approvals(
+            tenant.id, ("approved", "rejected", "needs_info", "timed_out", "cancelled"), 15)
+        return {"pending": [_approval_view(deps, tenant, a, now) for a in reversed(pending)],
+                "recent": [_approval_view(deps, tenant, a, now) for a in recent]}
+
+    @router.post("/portal/api/approvals/{approval_id}/decision")
+    async def api_approval_decision(request: Request, approval_id: str):
+        user, tenant = api_user(request, "approvals.decide")
+        body = await request.json()
+        decision, note = str(body.get("decision", "")), str(body.get("note", "")).strip()
+        current = deps.tenants.get_approval(tenant.id, approval_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="request not found")
+        if current["category"] == "allergy" and decision in ("approved", "rejected") and not note:
+            raise HTTPException(status_code=400, detail="allergy decisions need a note for the caller")
+        try:
+            done = deps.tenants.decide_approval(tenant.id, approval_id, decision, note, user.id,
+                                                expected_version=body.get("expected_version"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if done is None:
+            raise HTTPException(status_code=409, detail="already decided, expired, or cancelled")
+        return {"ok": True, "status": done["status"]}
+
+    @router.put("/portal/api/approvals/settings")
+    async def api_approval_settings(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        body = await request.json()
+        try:
+            hold = int(body.get("hold_seconds", 60))
+            large = float(body.get("large_order_total", 0) or 0)
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "numbers only"}, status_code=400)
+        if not 20 <= hold <= 180 or large < 0:
+            return JSONResponse({"ok": False, "error": "hold time must be 20-180 seconds"},
+                                status_code=400)
+        on_timeout = str(body.get("on_timeout", "offer_transfer"))
+        if on_timeout not in hitl.ON_TIMEOUT:
+            return JSONResponse({"ok": False, "error": "unknown timeout option"}, status_code=400)
+        values = {"approvals_hold_seconds": str(hold), "approvals_large_order_total": f"{large:g}",
+                  "approvals_on_timeout": on_timeout}
+        before = {k: tenant.settings.get(k, "") for k in values}
+        deps.tenants.set_settings(tenant.id, values)
+        deps.tenants.audit("user", user.id, tenant.id, "approvals.settings", "approvals", before, values)
+        enabled = bool(body.get("enabled"))
+        if enabled != deps.tenants.flag_enabled(tenant.id, "hitl_enabled"):
+            deps.tenants.set_flag(tenant.id, "hitl_enabled", enabled, actor=user.id)
+        return {"ok": True}
+
     @router.get("/portal/customers", response_class=HTMLResponse)
     async def customers_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "customers.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1246,12 +1852,12 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/customers")
     async def api_customers(request: Request, limit: int = 100):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "customers.view")
         return {"customers": deps.tenants.list_customers(tenant.id, max(1, min(limit, 500)))}
 
     @router.get("/portal/settings", response_class=HTMLResponse)
     async def settings_page(request: Request, saved: int = 0):
-        res = page_user(request)
+        res = page_user(request, "settings.edit")
         if isinstance(res, RedirectResponse):
             return res
         user, tenant = res
@@ -1259,7 +1865,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/pos", response_class=HTMLResponse)
     async def pos_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "pos.edit")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1267,7 +1873,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/calls", response_class=HTMLResponse)
     async def calls_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "calls.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1275,7 +1881,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/calls/{call_sid}", response_class=HTMLResponse)
     async def call_detail_page(request: Request, call_sid: str):
-        res = page_user(request)
+        res = page_user(request, "calls.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1285,7 +1891,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/support", response_class=HTMLResponse)
     async def support_page(request: Request, sent: int = 0):
-        res = page_user(request)
+        res = page_user(request, "support.use")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1293,7 +1899,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.post("/portal/support/request")
     async def support_request(request: Request):
-        res = page_user(request)
+        res = page_user(request, "support.use")
         if isinstance(res, RedirectResponse):
             return res
         user, tenant = res
@@ -1310,7 +1916,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/marketing", response_class=HTMLResponse)
     async def marketing_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "reports.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1318,7 +1924,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/usage", response_class=HTMLResponse)
     async def usage_page(request: Request):
-        res = page_user(request)
+        res = page_user(request, "reports.view")
         if isinstance(res, RedirectResponse):
             return res
         _, tenant = res
@@ -1326,7 +1932,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.post("/portal/api/tickets/{ticket_id}/ack")
     async def api_ticket_ack(request: Request, ticket_id: str):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "support.use")
         if not deps.tenants.ack_ticket(tenant.id, ticket_id):
             raise HTTPException(status_code=404, detail="ticket not found")
         return RedirectResponse("/portal/support", status_code=302)
@@ -1334,12 +1940,12 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
     # -- JSON API --------------------------------------------------------
     @router.get("/portal/api/calls")
     async def api_calls(request: Request, limit: int = 30):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "calls.view")
         return {"calls": deps.tenants.list_calls(tenant.id, min(limit, 100))}
 
     @router.get("/portal/api/calls/{call_sid}")
     async def api_call_detail(request: Request, call_sid: str):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "calls.view")
         t = deps.tenants.get_transcript(tenant.id, call_sid)
         if not t:
             raise HTTPException(status_code=404, detail="call not found")
@@ -1347,7 +1953,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/orders")
     async def api_orders(request: Request, limit: int = 30):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "orders.view")
         orders = deps.order_store.list_by_tenant(tenant.id, min(limit, 100))
         return {"orders": [
             {"order_id": o.get("order_id"), "order_number": o.get("order_number"),
@@ -1358,7 +1964,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/orders.csv")
     async def api_orders_csv(request: Request, days: int = 0):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "orders.view")
         stamp = time.strftime("%Y%m%d")
         return Response(
             content=_orders_csv(deps, tenant, max(0, min(days, 3650))),
@@ -1368,17 +1974,17 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/tickets")
     async def api_tickets(request: Request):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "support.use")
         return {"tickets": deps.tenants.list_tickets(tenant.id)}
 
     @router.get("/portal/api/marketing")
     async def api_marketing(request: Request, limit: int = 20):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "reports.view")
         return {"drafts": deps.tenants.list_drafts(tenant.id, min(limit, 100))}
 
     @router.get("/portal/api/usage")
     async def api_usage(request: Request, limit: int = 30):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "reports.view")
         return {"usage": deps.tenants.get_usage(tenant.id, min(limit, 90))}
 
     def _pos_view(tenant: Tenant) -> dict:
@@ -1398,7 +2004,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.get("/portal/api/pos")
     async def api_pos_get(request: Request):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "pos.edit")
         return _pos_view(tenant)
 
     def _merged_creds(tenant: Tenant, provider: str, values: dict) -> tuple[dict, str]:
@@ -1424,7 +2030,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.post("/portal/api/pos")
     async def api_pos_save(request: Request):
-        _, tenant = api_user(request)
+        user, tenant = api_user(request, "pos.edit")
         body = await request.json()
         provider = str(body.get("provider", ""))
         merged, err = _merged_creds(tenant, provider, body.get("values"))
@@ -1432,13 +2038,16 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
             return JSONResponse({"ok": False, "error": err}, status_code=400)
         deps.tenants.set_secret(tenant.id, provider, merged)
         deps.tenants.set_settings(tenant.id, {"pos_profile": provider})
+        # Field names and non-secret values only; redact() masks the secrets.
+        deps.tenants.audit("user", user.id, tenant.id, "pos.credentials_saved", f"pos:{provider}",
+                           {"pos_profile": tenant.setting("pos_profile", "")}, merged)
         deps.on_config_changed(tenant.id)
         log.info("portal: tenant %s saved %s credentials", tenant.id, provider)
         return {"ok": True}
 
     @router.post("/portal/api/pos/test")
     async def api_pos_test(request: Request):
-        _, tenant = api_user(request)
+        _, tenant = api_user(request, "pos.edit")
         body = await request.json()
         provider = str(body.get("provider", ""))
         merged, err = _merged_creds(tenant, provider, body.get("values"))
@@ -1455,7 +2064,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
 
     @router.post("/portal/api/settings")
     async def api_settings_save(request: Request):
-        _, tenant = api_user(request)
+        user, tenant = api_user(request, "settings.edit")
         body = await request.json()
         allowed = {f["key"] for f in SETTING_FIELDS} | VOICE_SETTING_KEYS | {"timezone"}
         values = {k: str(v).strip() for k, v in body.items() if k in allowed}
@@ -1486,7 +2095,12 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
                 deps.tenants.set_phone_number(tenant.id, values["phone_number"])
             except ValueError as exc:
                 return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+        before = {k: tenant.settings.get(k, "") for k in values}
         deps.tenants.set_settings(tenant.id, values)
+        changed = {k: v for k, v in values.items() if before.get(k, "") != v}
+        if changed:
+            deps.tenants.audit("user", user.id, tenant.id, "settings.update", "settings",
+                               {k: before[k] for k in changed}, changed)
         deps.on_config_changed(tenant.id)
         return {"ok": True}
 
@@ -1495,7 +2109,7 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
         """Render a short sample with the selected (not yet saved) voice and
         model so owners can hear it before committing. Session-authenticated;
         rate-limited per user because every preview spends ElevenLabs chars."""
-        user, tenant = api_user(request)
+        user, tenant = api_user(request, "settings.edit")
         now = time.monotonic()
         bucket = _preview_buckets.get(user.id, [])
         bucket = [t for t in bucket if now - t < 3600]

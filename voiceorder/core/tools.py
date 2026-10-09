@@ -410,12 +410,13 @@ def submit_order(
     try:
         order = pos.submit(cart, idempotency_key)
     except PosError:
-        # Safe landing: the order is parked for staff instead of vanishing.
+        # Safe landing: the app parks the order for staff (saved + alert) instead
+        # of letting it vanish; the caller is told it is NOT confirmed yet.
         return ToolResult(
             ok=False,
             message=(
-                "I've saved your order and the restaurant will confirm it. "
-                "They may call you back at this number."
+                "I couldn't get your order into the restaurant's system just now, so I've "
+                "passed it to the staff. They'll call you back at this number to confirm it."
             ),
             data={"cart": cart.summary(), "backup": True},
             error_code="pos_unavailable",

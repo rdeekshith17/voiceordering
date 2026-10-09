@@ -14,6 +14,14 @@ services:
       # outside Postgres (e.g. a free neon.tech database). See deploy/DEPLOY.md.
       - key: DATABASE_URL
         sync: false
+      # Background agents (support, fraud, menu sync, billing, onboarding, QA,
+      # marketing) run inside the app on their own schedule.
+      - key: AGENTS_ENABLED
+        value: 1
+      # The public text demo (/chat) would place real Square orders for anyone
+      # on the internet and spend AI credits, so it's off in production.
+      - key: CHAT_DEMO_ENABLED
+        value: 0
       # Clock for pickup times told to callers and in SMS receipts (else UTC).
       - key: TZ
         value: America/Chicago

@@ -193,6 +193,35 @@ textarea{min-height:150px;resize:vertical}
 .dark .n.g{color:#22c47c}.dark .n.o{color:#f59e0b}
 .dark .nl{font-family:var(--mono);font-size:13px;letter-spacing:.06em;color:#9aa1ab;margin-top:10px;text-transform:uppercase}
 
+/* AI phone page */
+.sched{display:grid;grid-template-columns:120px 1fr;gap:10px 18px;align-items:start}
+.sched .day{padding-top:12px;font-weight:600}
+.sched .wins{display:flex;flex-direction:column;gap:8px}
+.win{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.win input{width:auto;padding:9px 12px}
+.linkbtn{background:none;border:0;color:var(--acc-ink);font:600 14px var(--font);cursor:pointer;padding:6px 0;text-align:left}
+.linkbtn.rm{color:var(--bad)}
+.choice{display:flex;gap:12px;flex-wrap:wrap;margin-top:6px}
+.choice label{display:flex;gap:10px;align-items:center;border:1px solid var(--line);border-radius:9px;
+  padding:12px 16px;cursor:pointer;background:#fff;font-weight:500}
+.choice input{width:auto}
+.choice label:has(input:checked){border-color:var(--acc);background:var(--acc-soft)}
+.switch{display:flex;gap:12px;align-items:center;font-weight:600;cursor:pointer}
+.switch input{width:20px;height:20px;accent-color:var(--acc)}
+.state{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.state .big{font-size:24px;font-weight:700}
+@media(max-width:860px){.sched{grid-template-columns:1fr}.sched .day{padding-top:0}}
+
+/* kitchen */
+.req{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px 22px;margin-bottom:16px}
+.req.allergy{border-color:#f3b49b;box-shadow:inset 4px 0 0 var(--bad)}
+.req .req-top{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.req .left{margin-left:auto;font-family:var(--mono);font-size:14px;font-weight:600}
+.req .left.low{color:var(--bad)}
+.req .what{font-size:20px;font-weight:600;margin:12px 0 4px}
+.req .acts{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+.btn.bad{background:var(--bad)}.btn.warn2{background:#8a5a00}
+
 /* charts */
 .legend{display:flex;gap:18px;font-size:14px;color:var(--mut)}
 .legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle}
@@ -257,6 +286,10 @@ _ICONS = {
              '<path d="M15 16v-4"/><path d="M19 16V8"/><path d="m7 9 4-4 4 3 5-5"/>',
     "bag": '<path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/>'
            '<path d="M16 10a4 4 0 0 1-8 0"/>',
+    "chef": '<path d="M17 21a1 1 0 0 0 1-1v-5.35c0-.457.316-.844.727-1.041a4 4 0 0 0-2.134-7.589 '
+            '5 5 0 0 0-9.186 0 4 4 0 0 0-2.134 7.588c.411.198.727.585.727 1.041V20a1 1 0 0 0 1 1Z"/>'
+            '<path d="M6 17h12"/>',
+    "clock": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
     "users": '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>'
              '<path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
     "phone": '<path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 '
@@ -299,12 +332,14 @@ NAV = [
     ("Command", [
         ("dash", "Dashboard", "/portal/", "grid"),
         ("stats", "Statistics", "/portal/statistics", "chart"),
+        ("kitchen", "Kitchen", "/portal/kitchen", "chef"),
         ("orders", "Orders", "/portal/orders", "bag"),
         ("customers", "Customers", "/portal/customers", "users"),
         ("calls", "Live calls", "/portal/calls", "phone"),
     ]),
     ("Management", [
         ("pos", "POS setup", "/portal/pos", "pos"),
+        ("phone", "AI phone", "/portal/phone", "clock"),
         ("marketing", "Marketing", "/portal/marketing", "megaphone"),
         ("usage", "Usage", "/portal/usage", "gauge"),
     ]),
@@ -350,18 +385,23 @@ _SHELL_JS = """
 
 def shell(*, title: str, body: str, tenant_name: str, active: str, platform: str,
           live_calls: int = 0, status_label: str = "", status_ok: bool = True,
-          location: str = "Primary location") -> str:
+          location: str = "Primary location", visible: set[str] | None = None,
+          nav: list | None = None, home_href: str = "/portal/",
+          logout_href: str = "/portal/logout") -> str:
     """Signed-in page: dark sidebar + white top bar + light content area."""
     groups = []
-    for heading, links in NAV:
+    for heading, links in (nav or NAV):
         items = []
         for key, label, href, ic in links:
+            if visible is not None and key not in visible:
+                continue
             count = (f'<span class="count">{live_calls}</span>'
                      if key == "calls" and live_calls else "")
             items.append(
                 f'<a class="nav-a{" on" if key == active else ""}" href="{href}" title="{label}">'
                 f'{icon(ic)}<span class="lbl">{label}</span>{count}</a>')
-        groups.append(f'<div class="nav-h">{heading}</div>{"".join(items)}')
+        if items:
+            groups.append(f'<div class="nav-h">{heading}</div>{"".join(items)}')
     tname = html.escape(tenant_name)
     av = initials(tenant_name)
     badge = (f'<span class="badge{"" if status_ok else " warn"}">{html.escape(status_label)}</span>'
@@ -372,11 +412,11 @@ def shell(*, title: str, body: str, tenant_name: str, active: str, platform: str
 <style>{CSS}</style></head><body>
 <div class="app">
 <aside class="side">
-  <a class="brand" href="/portal/"><span class="logo">{html.escape(platform[:1])}</span><span>{html.escape(platform)}</span></a>
+  <a class="brand" href="{home_href}"><span class="logo">{html.escape(platform[:1])}</span><span>{html.escape(platform)}</span></a>
   <nav class="navs">{"".join(groups)}</nav>
   <div class="side-foot"><div class="av">{av}</div>
     <div class="who"><b>{tname}</b><span>{html.escape(location)}</span></div>
-    <a class="out" href="/portal/logout" title="Log out">{icon("logout", 18)}</a></div>
+    <a class="out" href="{logout_href}" title="Log out">{icon("logout", 18)}</a></div>
 </aside>
 <div class="main">
   <header class="top">

@@ -1,18 +1,22 @@
 """Owner app (Phase 4): dashboard, menu manager, backup order screen.
 
-Auth: OWNER_SECRET env. Every endpoint accepts an X-Owner-Secret header or a
-?key= query param (the HTML pages use ?key= so their JS can call the API).
-Until OWNER_SECRET is set, local traffic is allowed with a warning -- the same
-convention as VOICE_SECRET. Production should put real session auth in front.
+Auth: a signed-in restaurant Admin of this restaurant (the portal session), or
+an X-Owner-Secret header with OWNER_SECRET for scripts. The secret is never
+accepted in the URL (it leaked into history, logs and shared links). Until
+OWNER_SECRET is set, local traffic is allowed with a warning -- the same
+convention as VOICE_SECRET.
 """
 from __future__ import annotations
 
+import hmac
+import html as _html
 import logging
+from typing import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from ..core import tools
@@ -32,6 +36,8 @@ class OwnerDeps:
     order_store: InMemoryOrderStore
     ctx: RestaurantContext
     owner_secret: str = ""
+    # True when the request carries a portal session of this restaurant's admin.
+    session_ok: Callable[[Request], bool] | None = None
 
 
 class AvailabilityRequest(BaseModel):
@@ -58,21 +64,30 @@ def build_owner_router(deps: OwnerDeps) -> APIRouter:
     if not deps.owner_secret:
         log.warning("OWNER_SECRET is not set; owner endpoints accept unauthenticated local calls")
 
-    def require_owner(request: Request) -> None:
+    def allowed(request: Request) -> bool:
+        if deps.session_ok is not None and deps.session_ok(request):
+            return True
         if not deps.owner_secret:
-            return
-        header = request.headers.get("x-owner-secret")
-        key = request.query_params.get("key")
-        if header != deps.owner_secret and key != deps.owner_secret:
-            raise HTTPException(status_code=401, detail="invalid owner secret")
+            return deps.session_ok is None  # dev mode only when no portal is wired
+        header = request.headers.get("x-owner-secret", "")
+        return bool(header) and hmac.compare_digest(header, deps.owner_secret)
+
+    def require_owner(request: Request) -> None:
+        if not allowed(request):
+            raise HTTPException(status_code=401, detail="log in to the portal as the restaurant admin")
+
+    def page(html: str, request: Request):
+        if not allowed(request):
+            return RedirectResponse("/portal/login", status_code=302)
+        return HTMLResponse(html.replace("__RESTAURANT__", _html.escape(deps.ctx.restaurant_name)))
 
     @router.get("/owner", response_class=HTMLResponse)
-    def owner_dashboard(_auth: None = Depends(require_owner)) -> str:
-        return _DASHBOARD_HTML.replace("__RESTAURANT__", deps.ctx.restaurant_name)
+    def owner_dashboard(request: Request):
+        return page(_DASHBOARD_HTML, request)
 
     @router.get("/owner/backup", response_class=HTMLResponse)
-    def backup_screen(_auth: None = Depends(require_owner)) -> str:
-        return _BACKUP_HTML.replace("__RESTAURANT__", deps.ctx.restaurant_name)
+    def backup_screen(request: Request):
+        return page(_BACKUP_HTML, request)
 
     @router.get("/owner/orders")
     def owner_orders(limit: int = 50, _auth: None = Depends(require_owner)) -> dict:
@@ -201,22 +216,22 @@ table{border-collapse:collapse;width:100%}td,th{border:1px solid #ddd;padding:.4
 <h3>Recent orders</h3><div id="orders">loading&hellip;</div>
 <h3>Menu</h3><div id="menu">loading&hellip;</div>
 <script>
-const key=new URLSearchParams(location.search).get('key')||'';
-document.getElementById('backupLink').href='/owner/backup'+(key?'?key='+encodeURIComponent(key):'');
-const qs=key?'?key='+encodeURIComponent(key):'';
-async function get(p){const r=await fetch(p+qs);if(!r.ok)throw new Error(await r.text());return r.json();}
-async function post(p,body){const r=await fetch(p+qs,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());return r.json();}
+document.getElementById('backupLink').href='/owner/backup';
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+async function get(p){const r=await fetch(p);if(!r.ok)throw new Error(await r.text());return r.json();}
+async function post(p,body){const r=await fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});if(!r.ok)throw new Error(await r.text());return r.json();}
 async function loadOrders(){
   const j=await get('/owner/orders');
   if(!j.orders.length){document.getElementById('orders').innerHTML='<i>no orders yet</i>';return;}
   document.getElementById('orders').innerHTML='<table><tr><th>#</th><th>Time</th><th>Customer</th><th>Items</th><th>Total</th><th>Status</th><th>Via</th></tr>'+
-    j.orders.map(o=>'<tr><td>'+o.order_number+'</td><td>'+o.saved_at+'</td><td>'+(o.customer_name||'')+'</td><td>'+o.lines.join(', ')+'</td><td>$'+o.total+'</td><td>'+o.status+'</td><td>'+o.via+'</td></tr>').join('')+'</table>';
+    j.orders.map(o=>'<tr><td>'+esc(o.order_number)+'</td><td>'+esc(o.saved_at)+'</td><td>'+esc(o.customer_name||'')+'</td><td>'+esc(o.lines.join(', '))+'</td><td>$'+esc(o.total)+'</td><td>'+esc(o.status)+'</td><td>'+esc(o.via)+'</td></tr>').join('')+'</table>';
 }
 async function loadMenu(){
   const j=await get('/owner/menu');
   document.getElementById('menu').innerHTML='<table><tr><th>Item</th><th>Price</th><th>Status</th><th></th></tr>'+
-    j.items.map(i=>'<tr class="'+(i.available?'':'out')+'"><td>'+i.name+'</td><td>$'+i.price.toFixed(2)+'</td><td>'+(i.available?'available':"86'd")+'</td>'+
-    '<td><button class="btn" onclick="toggleAvail(\\''+i.ref+'\\','+(!i.available)+')">'+(i.available?'86':'restore')+'</button></td></tr>').join('')+'</table>';
+    j.items.map(i=>'<tr class="'+(i.available?'':'out')+'"><td>'+esc(i.name)+'</td><td>$'+i.price.toFixed(2)+'</td><td>'+(i.available?'available':"86'd")+'</td>'+
+    '<td><button class="btn" data-ref="'+esc(i.ref)+'" data-avail="'+(!i.available)+'">'+(i.available?'86':'restore')+'</button></td></tr>').join('')+'</table>';
+  document.querySelectorAll('#menu [data-ref]').forEach(b=>b.onclick=()=>toggleAvail(b.dataset.ref,b.dataset.avail==='true'));
 }
 async function toggleAvail(ref,avail){await post('/owner/menu/availability',{item_ref:ref,available:avail});loadMenu();}
 loadOrders();loadMenu();setInterval(loadOrders,10000);
@@ -235,30 +250,30 @@ _BACKUP_HTML = """<!doctype html>
 <button onclick="submitOrder()" style="padding:.6em 2em">Fire order</button></div>
 <div id="result"></div>
 <script>
-const key=new URLSearchParams(location.search).get('key')||'';
-const qs=key?'?key='+encodeURIComponent(key):'';
 let ticket={};
-async function get(p){const r=await fetch(p+qs);if(!r.ok)throw new Error(await r.text());return r.json();}
+function esc(s){const d=document.createElement('div');d.textContent=s==null?'':String(s);return d.innerHTML;}
+async function get(p){const r=await fetch(p);if(!r.ok)throw new Error(await r.text());return r.json();}
 async function init(){
   const j=await get('/owner/menu');
   const byCat={};
   j.items.forEach(i=>{(byCat[i.category]=byCat[i.category]||[]).push(i);});
   document.getElementById('items').innerHTML=Object.keys(byCat).map(c=>
-    '<h4>'+c+'</h4>'+byCat[c].map(i=>'<button '+(i.available?'':'disabled')+
-      ' onclick="add(\\''+i.ref+'\\',\\''+i.name.replace(/'/g,"")+'\\')">'+i.name+' $'+i.price.toFixed(2)+(i.available?'':" (86'd)")+'</button>').join('')
+    '<h4>'+esc(c)+'</h4>'+byCat[c].map(i=>'<button '+(i.available?'':'disabled')+
+      ' data-ref="'+esc(i.ref)+'" data-name="'+esc(i.name)+'">'+esc(i.name)+' $'+i.price.toFixed(2)+(i.available?'':" (86'd)")+'</button>').join('')
   ).join('');
+  document.querySelectorAll('#items [data-ref]').forEach(b=>b.onclick=()=>add(b.dataset.ref,b.dataset.name));
 }
 function add(ref,name){ticket[ref]=ticket[ref]||{name:name,qty:0};ticket[ref].qty++;render();}
 function render(){
   const refs=Object.keys(ticket);
-  document.getElementById('lines').innerHTML=refs.length?refs.map(r=>ticket[r].qty+'x '+ticket[r].name).join('<br>'):'<i>nothing yet</i>';
+  document.getElementById('lines').innerHTML=refs.length?refs.map(r=>ticket[r].qty+'x '+esc(ticket[r].name)).join('<br>'):'<i>nothing yet</i>';
 }
 async function submitOrder(){
   const lines=Object.keys(ticket).map(r=>({item_ref:r,quantity:ticket[r].qty}));
   const body={lines:lines,customer_name:document.getElementById('cname').value,customer_phone:document.getElementById('cphone').value};
   const el=document.getElementById('result');el.textContent='sending…';
   try{
-    const r=await fetch('/owner/backup/submit'+qs,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const r=await fetch('/owner/backup/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const j=await r.json();
     if(!r.ok)throw new Error((j.detail&&j.detail.message)||JSON.stringify(j.detail));
     el.textContent='Order #'+j.order.order_number+' fired! Total $'+j.order.totals.total+'. '+j.order.payment.instructions;
