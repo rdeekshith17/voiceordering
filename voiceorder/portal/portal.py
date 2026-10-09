@@ -142,7 +142,7 @@ _TZ_GUESS_JS = """<script>(function(){try{
 
 # Role of the user the current page is rendered for (set by page_user), so the
 # sidebar only shows pages that role may open.
-_viewer_role: ContextVar[str] = ContextVar("viewer_role", default="owner")
+_viewer_role: ContextVar[str] = ContextVar("viewer_role", default="admin")
 
 # Sidebar key -> permission needed to see it.
 _NAV_PERMISSION = {

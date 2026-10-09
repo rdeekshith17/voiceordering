@@ -41,7 +41,7 @@ class PortalUser:
     id: str
     tenant_id: str
     email: str
-    role: str = "owner"
+    role: str = "admin"
 
 
 @dataclass
@@ -296,7 +296,7 @@ class TenantStore:
 
     # -- portal users ------------------------------------------------------
     def create_user(self, tenant_id: str, email: str, password: str,
-                    role: str = "owner") -> PortalUser:
+                    role: str = "admin") -> PortalUser:
         email = email.strip().lower()
         if not email or "@" not in email or len(password) < 8:
             raise ValueError("need a valid email and a password of 8+ characters")
@@ -325,7 +325,7 @@ class TenantStore:
             ).fetchone()
         if not row or not crypto.verify_password(password, row[3]):
             return None
-        return PortalUser(id=row[0], tenant_id=row[1], email=row[2], role=row[4])
+        return PortalUser(id=row[0], tenant_id=row[1], email=row[2], role=rbac.normalize_role(row[4]))
 
     def get_user(self, user_id: str) -> PortalUser | None:
         with self._lock:
@@ -333,7 +333,7 @@ class TenantStore:
                 "SELECT id, tenant_id, email, role FROM tenant_users WHERE id = ?",
                 (user_id,),
             ).fetchone()
-        return PortalUser(id=row[0], tenant_id=row[1], email=row[2], role=row[3]) if row else None
+        return PortalUser(id=row[0], tenant_id=row[1], email=row[2], role=rbac.normalize_role(row[3])) if row else None
 
     def list_users(self, tenant_id: str) -> list[PortalUser]:
         with self._lock:
@@ -341,18 +341,18 @@ class TenantStore:
                 "SELECT id, tenant_id, email, role FROM tenant_users WHERE tenant_id = ?"
                 " ORDER BY created_at", (tenant_id,),
             ).fetchall()
-        return [PortalUser(id=r[0], tenant_id=r[1], email=r[2], role=r[3]) for r in rows]
+        return [PortalUser(id=r[0], tenant_id=r[1], email=r[2], role=rbac.normalize_role(r[3])) for r in rows]
 
     def set_user_role(self, tenant_id: str, user_id: str, role: str) -> bool:
-        """Tenant-scoped role change. Refuses to remove the restaurant's last owner."""
+        """Tenant-scoped role change. Refuses to remove the restaurant's last admin."""
         if role not in rbac.ROLES:
             raise ValueError(f"unknown role {role!r}")
         users = {u.id: u for u in self.list_users(tenant_id)}
         if user_id not in users:
             return False
-        owners = [u for u in users.values() if u.role == "owner"]
-        if role != "owner" and owners == [users[user_id]]:
-            raise ValueError("a restaurant needs at least one owner")
+        admins = [u for u in users.values() if rbac.normalize_role(u.role) == "admin"]
+        if role != "admin" and admins == [users[user_id]]:
+            raise ValueError("a restaurant needs at least one admin")
         with self._lock:
             self._conn.execute("UPDATE tenant_users SET role = ? WHERE id = ? AND tenant_id = ?",
                                (role, user_id, tenant_id))
@@ -639,8 +639,9 @@ class TenantStore:
             ).fetchone()
         return row[0] if row else 0
 
-    # -- platform users (super admin / support) -----------------------------
-    def create_platform_user(self, email: str, password: str, role: str = "support") -> PlatformUser:
+    # -- platform users (super admins) --------------------------------------
+    def create_platform_user(self, email: str, password: str,
+                             role: str = "super_admin") -> PlatformUser:
         email = email.strip().lower()
         if not email or "@" not in email or len(password) < 12:
             raise ValueError("need a valid email and a password of 12+ characters")

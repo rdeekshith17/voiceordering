@@ -27,7 +27,7 @@ def test_fresh_database_gets_every_migration_once(tmp_path):
         assert db.columns(table), table
 
 
-def test_existing_database_is_upgraded_and_old_users_stay_owners(tmp_path):
+def test_existing_database_is_upgraded_and_old_users_become_admins(tmp_path):
     path = tmp_path / "legacy.db"
     old = sqlite3.connect(path)  # the pre-PR 1 users table: no role column
     old.execute("CREATE TABLE tenant_users (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL,"
@@ -36,7 +36,7 @@ def test_existing_database_is_upgraded_and_old_users_stay_owners(tmp_path):
     old.commit()
     old.close()
     store = TenantStore(path)
-    assert store.get_user("u1").role == "owner"
+    assert store.get_user("u1").role == "admin"
     assert "001_user_roles" in applied_versions(store._conn)
 
 
@@ -60,7 +60,7 @@ def _login(app, email, password="password123"):
     return client, r
 
 
-def test_owner_keeps_full_access_and_sees_every_page(tmp_path):
+def test_admin_keeps_full_access_and_sees_every_page(tmp_path):
     app, store, tenant, owner = _portal(tmp_path)
     page = owner.get("/portal/").text
     for link in ("/portal/settings", "/portal/pos", "/portal/statistics", "/portal/support"):
@@ -83,26 +83,26 @@ def test_kitchen_staff_only_reach_orders(tmp_path):
     assert store.get_tenant(tenant.id).setting("pickup_minutes", "") != "5"
 
 
-def test_manager_cannot_touch_pos_credentials(tmp_path):
+def test_only_admin_and_kitchen_roles_exist(tmp_path):
     app, store, tenant, _ = _portal(tmp_path)
-    store.create_user(tenant.id, "mgr@example.com", "password123", role="manager")
-    mgr, _ = _login(app, "mgr@example.com")
-    assert mgr.get("/portal/settings").status_code == 200
-    assert mgr.get("/portal/pos").headers["location"] == "/portal/"
-    r = mgr.post("/portal/api/pos", json={"provider": "square",
-                                          "values": {"access_token": "x", "location_id": "y"}})
-    assert r.status_code == 403
+    assert rbac.ROLES == ("admin", "kitchen") and store.list_users(tenant.id)[0].role == "admin"
+    for old_name in ("owner", "manager", "super_admin"):
+        with pytest.raises(ValueError):
+            store.create_user(tenant.id, f"{old_name}@example.com", "password123", role=old_name)
+    # A row written with an old role name still works, as an admin.
+    assert rbac.can("owner", "pos.edit") and rbac.can("manager", "settings.edit")
 
 
-def test_role_changes_are_tenant_scoped_and_keep_an_owner(tmp_path):
+def test_role_changes_are_tenant_scoped_and_keep_an_admin(tmp_path):
     app, store, tenant, _ = _portal(tmp_path)
-    owner = store.list_users(tenant.id)[0]
+    admin = store.list_users(tenant.id)[0]
     with pytest.raises(ValueError):
-        store.set_user_role(tenant.id, owner.id, "kitchen")  # last owner
+        store.set_user_role(tenant.id, admin.id, "kitchen")  # last admin
+    cook = store.create_user(tenant.id, "cook@example.com", "password123", role="kitchen")
+    assert store.set_user_role(tenant.id, cook.id, "admin")
+    assert store.set_user_role(tenant.id, admin.id, "kitchen")  # another admin exists now
     other = store.create_tenant("Taco Palace")
-    assert store.set_user_role(other.id, owner.id, "kitchen") is False
-    with pytest.raises(ValueError):
-        store.create_user(tenant.id, "x@example.com", "password123", role="admin")
+    assert store.set_user_role(other.id, cook.id, "kitchen") is False
 
 
 # --- platform users -----------------------------------------------------------------------
@@ -114,8 +114,9 @@ def test_platform_users_are_separate_from_restaurant_logins(tmp_path):
     assert store.verify_user("ops@voiceorder.ai", "a-long-password!") is None
     assert store.get_platform_user(admin.id).email == "ops@voiceorder.ai"
     with pytest.raises(ValueError):
-        store.create_platform_user("short@x.com", "short", "support")
-    assert rbac.platform_can("support", "tenants.view") and not rbac.platform_can("support", "flags.edit")
+        store.create_platform_user("short@x.com", "short-password-ok!", "support")  # no such role
+    assert rbac.PLATFORM_ROLES == ("super_admin",) and rbac.platform_can("super_admin", "flags.edit")
+    assert not rbac.platform_can("admin", "tenants.view")  # restaurant roles have no platform rights
 
 
 # --- feature flags ------------------------------------------------------------------------------

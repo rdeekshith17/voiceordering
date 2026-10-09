@@ -9,23 +9,27 @@ from __future__ import annotations
 import os
 
 # -- restaurant (tenant) roles ----------------------------------------------
-ROLES = ("owner", "manager", "kitchen")
+ROLES = ("admin", "kitchen")
 
 PERMISSIONS: dict[str, set[str]] = {
-    # Owners can do everything in their restaurant, including staff and POS.
-    "owner": {"reports.view", "orders.view", "calls.view", "customers.view",
+    # The restaurant's admin can do everything there, including staff and POS.
+    "admin": {"reports.view", "orders.view", "calls.view", "customers.view",
               "settings.edit", "pos.edit", "support.use", "team.manage",
               "approvals.decide"},
-    # Managers run the restaurant day to day but can't change POS credentials or staff.
-    "manager": {"reports.view", "orders.view", "calls.view", "customers.view",
-                "settings.edit", "support.use", "approvals.decide"},
     # Kitchen staff see orders and (from PR 3) decide kitchen approvals.
     "kitchen": {"orders.view", "approvals.decide"},
 }
 
+# Role names used before the admin/kitchen split; read as admin.
+_LEGACY_ROLES = {"owner": "admin", "manager": "admin"}
+
+
+def normalize_role(role: str | None) -> str:
+    return _LEGACY_ROLES.get(role or "", role or "")
+
 
 def can(role: str | None, permission: str) -> bool:
-    return permission in PERMISSIONS.get(role or "", set())
+    return permission in PERMISSIONS.get(normalize_role(role), set())
 
 
 def home_page(role: str | None) -> str:
@@ -34,12 +38,10 @@ def home_page(role: str | None) -> str:
 
 
 # -- platform roles ------------------------------------------------------------
-PLATFORM_ROLES = ("super_admin", "support")
+PLATFORM_ROLES = ("super_admin",)
 
 PLATFORM_PERMISSIONS: dict[str, set[str]] = {
     "super_admin": {"tenants.view", "tenants.edit", "flags.edit", "audit.view", "diagnostics.view"},
-    # Support can look but not change settings or see POS credentials.
-    "support": {"tenants.view", "audit.view", "diagnostics.view"},
 }
 
 

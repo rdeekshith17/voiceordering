@@ -25,20 +25,20 @@ _PG_LOCK_ID = 74_210_311
 
 
 def _m001_user_roles(db: Database) -> None:
-    # Existing portal users keep full rights: they become owners.
+    # Existing portal users keep full rights: they become admins.
     if "role" not in db.columns("tenant_users"):
-        db.execute("ALTER TABLE tenant_users ADD COLUMN role TEXT NOT NULL DEFAULT 'owner'")
+        db.execute("ALTER TABLE tenant_users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
 
 
 def _m002_platform_users(db: Database) -> None:
-    # Platform staff (super admin / support) are a separate identity from
+    # Platform staff (super admins) are a separate identity from
     # restaurant logins: a tenant owner can never gain platform rights.
     db.executescript("""
         CREATE TABLE IF NOT EXISTS platform_users (
           id TEXT PRIMARY KEY,
           email TEXT NOT NULL UNIQUE,
           password_hash TEXT NOT NULL,
-          role TEXT NOT NULL DEFAULT 'support',
+          role TEXT NOT NULL DEFAULT 'super_admin',
           active INTEGER NOT NULL DEFAULT 1,
           created_at REAL NOT NULL
         );

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create a platform (super admin / support) account.
+"""Create a platform super admin account.
 
 Platform accounts have no web signup on purpose. Run this where the app's
 database is reachable, e.g. locally with the production DATABASE_URL:

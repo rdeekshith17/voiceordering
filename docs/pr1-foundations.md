@@ -9,25 +9,29 @@ exactly as before for existing accounts. It is the base the next features
 | Area | Change |
 |---|---|
 | Migrations | `voiceorder/migrations.py`. Numbered steps, each applied once per database and recorded in `schema_migrations`. Runs at startup (Postgres takes an advisory lock). |
-| Roles | `tenant_users.role` = `owner` / `manager` / `kitchen`. Existing users became `owner`. Permissions live in `voiceorder/tenants/rbac.py`. |
+| Roles | Three logins only: restaurant **Admin** and **Kitchen** (`tenant_users.role` = `admin` / `kitchen`; existing users became `admin`), and platform **Super Admin**. Permissions live in `voiceorder/tenants/rbac.py`. |
 | Portal enforcement | Every portal route names the permission it needs. A page the role can't open redirects to the role's home page; an API call returns 403. The sidebar hides pages the role can't open. |
-| Platform users | `platform_users` (super_admin / support), separate from restaurant logins. Created only with `scripts/create_platform_user.py`. No UI yet (PR 4). |
+| Platform users | `platform_users` (role `super_admin`), separate from restaurant logins. Created only with `scripts/create_platform_user.py`. No UI yet (PR 4). |
 | Feature flags | `tenant_feature_flags`, all **off** by default: `voice_schedule_enabled`, `hitl_enabled`, `multilingual_enabled`. |
 | Audit log | `audit_logs`, append-only, secrets redacted. Written on signup, settings changes, POS credential saves, POS credentials copied from env at startup, flag changes, platform-user creation. |
 | Agents | `voiceorder/agents/scheduler.py` runs all 7 agents in the web app when `AGENTS_ENABLED=1`. A `job_runs` lease keeps each to one run per interval, even across restarts or several instances. |
 
 ### Role permissions
 
-| Permission | owner | manager | kitchen |
+| Permission | Admin | Kitchen | Super Admin |
 |---|:-:|:-:|:-:|
-| Dashboard, Statistics, Marketing, Usage | ✓ | ✓ | |
-| Orders | ✓ | ✓ | ✓ |
-| Customers, Live calls | ✓ | ✓ | |
-| System settings | ✓ | ✓ | |
-| POS setup (credentials) | ✓ | | |
-| Support | ✓ | ✓ | |
+| Dashboard, Statistics, Marketing, Usage | ✓ | | |
+| Orders | ✓ | ✓ | |
+| Customers, Live calls | ✓ | | |
+| System settings, POS setup | ✓ | | |
+| Support | ✓ | | |
 | Manage staff (UI in a later PR) | ✓ | | |
-| Decide kitchen approvals (PR 3) | ✓ | ✓ | ✓ |
+| Decide kitchen approvals (PR 3) | ✓ | ✓ | |
+| All restaurants, flags, audit (PR 4 screens) | | | ✓ |
+
+Super Admin is a separate login (`platform_users`); it has no access to the
+restaurant portal, and a restaurant login never has platform rights. Rows with
+the earlier role names `owner`/`manager` are read as `admin`.
 
 ### Agent schedule
 
