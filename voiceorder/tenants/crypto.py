@@ -61,22 +61,25 @@ def verify_password(password: str, stored: str) -> bool:
 
 
 # -- signed session cookies ---------------------------------------------------
-def _cookie_secret() -> bytes:
-    return hashlib.sha256(b"portal-cookie:" + _master_key()).digest()
+def _cookie_secret(purpose: str = "portal") -> bytes:
+    """Per-purpose signing key, so a restaurant session can never pass as a
+    platform-admin session or vice versa."""
+    return hashlib.sha256(purpose.encode() + b"-cookie:" + _master_key()).digest()
 
 
-def make_session_cookie(payload: dict, ttl_seconds: int = 86400 * 7) -> str:
+def make_session_cookie(payload: dict, ttl_seconds: int = 86400 * 7,
+                        purpose: str = "portal") -> str:
     body = dict(payload)
     body["exp"] = int(time.time()) + ttl_seconds
     raw = base64.urlsafe_b64encode(json.dumps(body).encode()).decode()
-    sig = hmac.new(_cookie_secret(), raw.encode(), hashlib.sha256).hexdigest()
+    sig = hmac.new(_cookie_secret(purpose), raw.encode(), hashlib.sha256).hexdigest()
     return f"{raw}.{sig}"
 
 
-def read_session_cookie(value: str) -> dict | None:
+def read_session_cookie(value: str, purpose: str = "portal") -> dict | None:
     try:
         raw, sig = value.rsplit(".", 1)
-        expect = hmac.new(_cookie_secret(), raw.encode(), hashlib.sha256).hexdigest()
+        expect = hmac.new(_cookie_secret(purpose), raw.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(expect, sig):
             return None
         body = json.loads(base64.urlsafe_b64decode(raw.encode()).decode())

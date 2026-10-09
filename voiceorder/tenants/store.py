@@ -230,15 +230,15 @@ class TenantStore:
             status=row[4], settings=self.get_settings(row[0]),
         )
 
-    def get_tenant_by_number(self, phone_number: str) -> Tenant | None:
+    def get_tenant_by_number(self, phone_number: str, include_inactive: bool = False) -> Tenant | None:
         phone = normalize_number(phone_number)
         if not phone:
             return None
+        q = "SELECT id FROM tenants WHERE phone_number = ?"
+        if not include_inactive:
+            q += " AND status = 'active'"
         with self._lock:
-            row = self._conn.execute(
-                "SELECT id FROM tenants WHERE phone_number = ? AND status = 'active'",
-                (phone,),
-            ).fetchone()
+            row = self._conn.execute(q, (phone,)).fetchone()
         return self.get_tenant(row[0]) if row else None
 
     def set_phone_number(self, tenant_id: str, phone_number: str) -> None:
@@ -494,6 +494,83 @@ class TenantStore:
             rows = self._conn.execute(q).fetchall()
         return [t for t in (self.get_tenant(r[0]) for r in rows) if t]
 
+    def set_tenant_status(self, tenant_id: str, status: str, actor: str) -> bool:
+        if status not in ("active", "suspended"):
+            raise ValueError("status must be active or suspended")
+        before = self.get_tenant(tenant_id)
+        if before is None:
+            return False
+        with self._lock:
+            self._conn.execute("UPDATE tenants SET status = ? WHERE id = ?", (status, tenant_id))
+            self._conn.commit()
+        self.audit("platform", actor, tenant_id, "tenant.status", f"tenant:{tenant_id}",
+                   {"status": before.status}, {"status": status})
+        return True
+
+    def reset_user_password(self, tenant_id: str, user_id: str, password: str, actor: str) -> bool:
+        if len(password) < 8:
+            raise ValueError("password must be 8+ characters")
+        with self._lock:
+            n = self._conn.execute(
+                "UPDATE tenant_users SET password_hash = ? WHERE id = ? AND tenant_id = ?",
+                (crypto.hash_password(password), user_id, tenant_id)).rowcount
+            self._conn.commit()
+        if n:
+            self.audit("platform", actor, tenant_id, "user.password_reset", f"user:{user_id}")
+        return n == 1
+
+    # -- platform-wide reads (Super Admin) ------------------------------------------
+    def _count_by_tenant(self, sql: str, params: tuple) -> dict[str, int]:
+        try:
+            with self._lock:
+                return {r[0]: int(r[1]) for r in self._conn.execute(sql, params).fetchall()}
+        except dbmod.Error:  # e.g. orders table absent in a bare test DB
+            return {}
+
+    def calls_by_tenant(self, since: float) -> dict[str, int]:
+        return self._count_by_tenant(
+            "SELECT tenant_id, COUNT(*) FROM call_transcripts WHERE started_at >= ?"
+            " GROUP BY tenant_id", (since,))
+
+    def orders_by_tenant(self, since: float) -> dict[str, int]:
+        return self._count_by_tenant(
+            "SELECT tenant_id, COUNT(*) FROM orders WHERE saved_at >= ? GROUP BY tenant_id",
+            (since,))
+
+    def open_tickets_by_tenant(self) -> dict[str, int]:
+        return self._count_by_tenant(
+            "SELECT COALESCE(tenant_id, '*'), COUNT(*) FROM tickets WHERE status = 'open'"
+            " GROUP BY COALESCE(tenant_id, '*')", ())
+
+    def platform_calls(self, since: float, limit: int = 200) -> list[dict]:
+        """Recent calls across every restaurant (newest first), with routing meta."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT call_sid, tenant_id, from_number, status, started_at, updated_at, meta"
+                " FROM call_transcripts WHERE started_at >= ? ORDER BY started_at DESC LIMIT ?",
+                (since, limit)).fetchall()
+        return [{"call_sid": r[0], "tenant_id": r[1], "from_number": r[2], "status": r[3],
+                 "started_at": r[4], "updated_at": r[5], "meta": json.loads(r[6] or "{}")}
+                for r in rows]
+
+    def platform_pending_approvals(self, limit: int = 100) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._APPROVAL_COLS} FROM approval_requests WHERE status = 'pending'"
+                " ORDER BY created_at LIMIT ?", (limit,)).fetchall()
+        return [self._approval_row(r) for r in rows]
+
+    def usage_by_tenant(self, month: str) -> dict[str, dict]:
+        """Sum of usage_daily rows for a 'YYYY-MM' month, per tenant."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT tenant_id, SUM(calls), SUM(talk_minutes), SUM(tts_chars), SUM(sms_sent),"
+                " MAX(computed_at) FROM usage_daily WHERE date LIKE ? GROUP BY tenant_id",
+                (month + "%",)).fetchall()
+        return {r[0]: {"calls": int(r[1] or 0), "talk_minutes": float(r[2] or 0),
+                       "tts_chars": int(r[3] or 0), "sms_sent": int(r[4] or 0),
+                       "computed_at": r[5]} for r in rows}
+
     def tenant_created_at(self, tenant_id: str) -> float | None:
         """created_at epoch for a tenant (onboarding agent staleness)."""
         with self._lock:
@@ -719,13 +796,17 @@ class TenantStore:
                    f"flag:{flag}", {"enabled": before}, {"enabled": bool(enabled)})
 
     def list_flags(self, tenant_id: str) -> dict[str, bool]:
+        saved = self.saved_flags(tenant_id)
+        return {f: saved.get(f, False) for f in rbac.KNOWN_FLAGS}
+
+    def saved_flags(self, tenant_id: str) -> dict[str, bool]:
+        """Only the flags explicitly set for this tenant ('*' = platform switches)."""
         with self._lock:
             rows = self._conn.execute(
                 "SELECT flag, enabled FROM tenant_feature_flags WHERE tenant_id = ?",
                 (tenant_id,),
             ).fetchall()
-        saved = {r[0]: bool(r[1]) for r in rows}
-        return {f: saved.get(f, False) for f in rbac.KNOWN_FLAGS}
+        return {r[0]: bool(r[1]) for r in rows}
 
     # -- audit log (append-only, secrets redacted) --------------------------
     def audit(self, actor_type: str, actor_id: str, tenant_id: str | None, action: str,
@@ -741,14 +822,18 @@ class TenantStore:
             )
             self._conn.commit()
 
-    def list_audit(self, tenant_id: str | None = None, limit: int = 100) -> list[dict]:
+    def list_audit(self, tenant_id: str | None = None, limit: int = 100,
+                   action_prefix: str = "") -> list[dict]:
         """A tenant's events, or every event when tenant_id is None (platform view)."""
         q = ("SELECT at, actor_type, actor_id, tenant_id, action, resource, before_json,"
-             " after_json FROM audit_logs")
+             " after_json FROM audit_logs WHERE 1 = 1")
         params: list = []
         if tenant_id is not None:
-            q += " WHERE tenant_id = ?"
+            q += " AND tenant_id = ?"
             params.append(tenant_id)
+        if action_prefix:
+            q += " AND action LIKE ?"
+            params.append(action_prefix.replace("%", "") + "%")
         q += " ORDER BY at DESC LIMIT ?"
         params.append(limit)
         with self._lock:

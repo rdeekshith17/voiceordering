@@ -385,10 +385,12 @@ _SHELL_JS = """
 
 def shell(*, title: str, body: str, tenant_name: str, active: str, platform: str,
           live_calls: int = 0, status_label: str = "", status_ok: bool = True,
-          location: str = "Primary location", visible: set[str] | None = None) -> str:
+          location: str = "Primary location", visible: set[str] | None = None,
+          nav: list | None = None, home_href: str = "/portal/",
+          logout_href: str = "/portal/logout") -> str:
     """Signed-in page: dark sidebar + white top bar + light content area."""
     groups = []
-    for heading, links in NAV:
+    for heading, links in (nav or NAV):
         items = []
         for key, label, href, ic in links:
             if visible is not None and key not in visible:
@@ -410,11 +412,11 @@ def shell(*, title: str, body: str, tenant_name: str, active: str, platform: str
 <style>{CSS}</style></head><body>
 <div class="app">
 <aside class="side">
-  <a class="brand" href="/portal/"><span class="logo">{html.escape(platform[:1])}</span><span>{html.escape(platform)}</span></a>
+  <a class="brand" href="{home_href}"><span class="logo">{html.escape(platform[:1])}</span><span>{html.escape(platform)}</span></a>
   <nav class="navs">{"".join(groups)}</nav>
   <div class="side-foot"><div class="av">{av}</div>
     <div class="who"><b>{tname}</b><span>{html.escape(location)}</span></div>
-    <a class="out" href="/portal/logout" title="Log out">{icon("logout", 18)}</a></div>
+    <a class="out" href="{logout_href}" title="Log out">{icon("logout", 18)}</a></div>
 </aside>
 <div class="main">
   <header class="top">

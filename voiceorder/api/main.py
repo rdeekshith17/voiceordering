@@ -62,6 +62,7 @@ from ..voice.tts import TtsError
 from ..voice_adapters import twilio as twilio_adapter
 from ..voice_adapters.text import TextAdapter
 from .owner import OwnerDeps, build_owner_router
+from ..admin.admin import AdminDeps, build_admin_router
 from ..portal.portal import PortalDeps, build_portal_router
 from ..tenants.store import Tenant, TenantStore, normalize_number, real_transfer_number
 from .storage import (
@@ -462,9 +463,11 @@ def _drop_tenant_caches(tenant_id: str) -> None:
 
 
 def resolve_call_tenant(to_number: str) -> Tenant:
-    """Route an incoming call to the tenant owning the dialed number."""
+    """Route an incoming call to the tenant owning the dialed number. A
+    suspended restaurant is returned as-is (the caller hears a closed message);
+    only numbers nobody owns fall back to the default restaurant."""
     # Fresh read: the startup copy of default_tenant doesn't see later settings changes.
-    return (tenant_store.get_tenant_by_number(to_number)
+    return (tenant_store.get_tenant_by_number(to_number, include_inactive=True)
             or tenant_store.get_tenant(default_tenant.id) or default_tenant)
 
 
@@ -496,6 +499,7 @@ app.include_router(
         )
     )
 )
+app.include_router(build_admin_router(AdminDeps(tenants=tenant_store, build_adapter=tenant_pos_adapter)))
 app.include_router(
     build_portal_router(
         PortalDeps(
@@ -724,6 +728,21 @@ _twilio_sessions: dict[str, AgentSession] = {}  # CallSid -> agent session
 _twilio_turns: dict[str, dict] = {}  # turn_id -> {"done": bool, ...}
 
 
+_signature_failure_logged: dict[str, float] = {}  # path -> last audit time
+
+
+def _record_signature_failure(path: str) -> None:
+    """Audit a rejected webhook, at most once a minute per path (no log flooding)."""
+    now = time.time()
+    if now - _signature_failure_logged.get(path, 0) < 60:
+        return
+    _signature_failure_logged[path] = now
+    try:
+        tenant_store.audit("system", "twilio", None, "webhook.signature_failed", path)
+    except Exception:
+        log.warning("could not audit webhook signature failure", exc_info=True)
+
+
 def _twilio_signature_ok(request: Request, form: dict[str, str]) -> bool:
     token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
@@ -740,7 +759,10 @@ def _twilio_signature_ok(request: Request, form: dict[str, str]) -> bool:
     # every poll request and the caller hears Twilio's "application error".
     if request.url.query:
         url = f"{url}?{request.url.query}"
-    return twilio_adapter.validate_signature(url, form, signature, token)
+    ok = twilio_adapter.validate_signature(url, form, signature, token)
+    if not ok:
+        _record_signature_failure(request.url.path)
+    return ok
 
 
 def _public_base_url() -> str:
@@ -1104,6 +1126,12 @@ async def twilio_voice(request: Request) -> Response:
     if not call_sid:
         raise HTTPException(status_code=400, detail="missing CallSid")
     tenant = resolve_call_tenant(str(form.get("To", "")))
+    if tenant.status != "active":
+        tenant_store.start_call(call_sid, tenant.id, str(form.get("From", "")), str(form.get("To", "")))
+        tenant_store.set_call_meta(call_sid, route="closed", reason="Restaurant suspended")
+        log.info("twilio call %s: %s is suspended", call_sid, tenant.name)
+        return _twiml_response(twilio_adapter.closed_message(
+            f"Thanks for calling {tenant.name}. We're not taking calls right now. Goodbye."))
     decision, routing_cfg, controls = routing_decision(tenant)
     if not decision.ai:
         tenant_store.start_call(
