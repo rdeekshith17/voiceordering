@@ -242,15 +242,36 @@ def _order_total(o: dict) -> float:
         return 0.0
 
 
-def _order_items(o: dict) -> str:
-    parts = []
+def _order_lines(o: dict) -> list[tuple[str, str]]:
+    """(item, details) per line: details are the chosen size/options and the
+    caller's note, exactly as sent to the POS (e.g. "with Guac · extra spicy")."""
+    out = []
     for line in o.get("lines") or []:
         name = str(line.get("item_name") or "").strip()
         if not name:
             continue
         qty = int(line.get("quantity") or 1)
-        parts.append(f"{name} (×{qty})" if qty > 1 else name)
-    return ", ".join(parts)
+        if line.get("variation_name"):
+            name += f" ({line['variation_name']})"
+        details = []
+        if line.get("modifier_names"):
+            details.append("with " + ", ".join(str(m) for m in line["modifier_names"]))
+        if str(line.get("note") or "").strip():
+            details.append(str(line["note"]).strip())
+        out.append((f"{name} (×{qty})" if qty > 1 else name, " · ".join(details)))
+    return out
+
+
+def _order_items(o: dict) -> str:
+    """Plain text, for search and the CSV export."""
+    return ", ".join(f"{item} [{details}]" if details else item for item, details in _order_lines(o))
+
+
+def _order_items_html(o: dict) -> str:
+    """Items for the tables: each on its own line, options and note underneath."""
+    return "".join(
+        f'<div>{_e(item)}{f"<div class=small style=color:var(--warn)>{_e(details)}</div>" if details else ""}</div>'
+        for item, details in _order_lines(o))
 
 
 def _order_no(o: dict) -> str:
@@ -341,7 +362,7 @@ def _orders_table(orders: list[dict], tz: tzinfo | None, with_time: bool) -> str
         rows.append(
             f'<tr data-status="{_e(label)}" data-q="{_e(search)}">'
             f'<td class="id">{_e(_order_no(o))}</td>'
-            f'<td>{_e(items) or "<span class=mut>—</span>"}</td>'
+            f'<td>{_order_items_html(o) or "<span class=mut>—</span>"}</td>'
             f'<td>{_money(_order_total(o))}</td>'
             f'<td><span class="pill {cls}">{_e(label)}</span></td>{when}</tr>')
     head = "<th>Time</th>" if with_time else ""
