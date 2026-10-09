@@ -137,6 +137,61 @@ def _m007_call_meta(db: Database) -> None:
         db.execute("ALTER TABLE call_transcripts ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'")
 
 
+def _m008_kitchen_approvals(db: Database) -> None:
+    # A request is decided at most once: status leaves 'pending' only via a
+    # compare-and-swap on (status, version). Events are append-only history.
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS approval_requests (
+          id TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL,
+          call_sid TEXT NOT NULL,
+          cart_id TEXT NOT NULL DEFAULT '',
+          line_id TEXT NOT NULL DEFAULT '',
+          item_name TEXT NOT NULL DEFAULT '',
+          category TEXT NOT NULL,
+          request_text TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'pending',
+          decision_note TEXT NOT NULL DEFAULT '',
+          decided_by TEXT NOT NULL DEFAULT '',
+          created_at REAL NOT NULL,
+          deadline_at REAL NOT NULL,
+          decided_at REAL,
+          relayed_at REAL,
+          version INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE INDEX IF NOT EXISTS idx_approvals_tenant_status
+          ON approval_requests (tenant_id, status, created_at);
+        CREATE INDEX IF NOT EXISTS idx_approvals_call ON approval_requests (call_sid);
+        CREATE TABLE IF NOT EXISTS approval_events (
+          id TEXT PRIMARY KEY,
+          approval_id TEXT NOT NULL,
+          tenant_id TEXT NOT NULL,
+          at REAL NOT NULL,
+          actor_type TEXT NOT NULL,
+          actor_id TEXT NOT NULL DEFAULT '',
+          event TEXT NOT NULL,
+          detail_json TEXT NOT NULL DEFAULT '{}'
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_events ON approval_events (approval_id, at);
+    """)
+
+
+def _m009_call_sessions(db: Database) -> None:
+    # The AI conversation of a live phone call, saved after every turn so a
+    # restart or deploy mid-call (e.g. while on hold for the kitchen) resumes it.
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS call_sessions (
+          call_sid TEXT PRIMARY KEY,
+          tenant_id TEXT NOT NULL,
+          cart_id TEXT NOT NULL,
+          caller_json TEXT NOT NULL DEFAULT 'null',
+          history_json TEXT NOT NULL DEFAULT '[]',
+          state_json TEXT NOT NULL DEFAULT '{}',
+          updated_at REAL NOT NULL
+        );
+    """)
+
+
 MIGRATIONS: list[tuple[str, Callable[[Database], None]]] = [
     ("001_user_roles", _m001_user_roles),
     ("002_platform_users", _m002_platform_users),
@@ -145,6 +200,8 @@ MIGRATIONS: list[tuple[str, Callable[[Database], None]]] = [
     ("005_job_runs", _m005_job_runs),
     ("006_voice_routing", _m006_voice_routing),
     ("007_call_meta", _m007_call_meta),
+    ("008_kitchen_approvals", _m008_kitchen_approvals),
+    ("009_call_sessions", _m009_call_sessions),
 ]
 
 

@@ -22,7 +22,7 @@ _TABLES = ["carts", "orders", "tenants", "tenant_settings", "tenant_secrets",
            "tenant_users", "call_transcripts", "tickets", "marketing_drafts", "usage_daily",
            "customers", "schema_migrations", "platform_users", "tenant_feature_flags",
            "audit_logs", "job_runs", "voice_routing", "voice_routing_windows",
-           "voice_routing_overrides"]
+           "voice_routing_overrides", "approval_requests", "approval_events", "call_sessions"]
 
 
 @pytest.fixture(autouse=True)
@@ -179,3 +179,30 @@ def test_voice_routing_on_postgres():
     tenants.start_call("CA1", t.id, "+1", "+2")
     tenants.set_call_meta("CA1", route="voicemail", voicemail_seconds=12)
     assert tenants.get_transcript(t.id, "CA1")["meta"] == {"route": "voicemail", "voicemail_seconds": 12}
+
+
+def test_kitchen_decisions_race_on_postgres():
+    import threading
+
+    _, _, tenants = _stores()
+    t = tenants.create_tenant("Hyderabad House")
+    a = tenants.create_approval(t.id, "CA1", "custom_modification", "no onions", 60)
+    stores = [_stores()[2] for _ in range(6)]  # six staff tablets, separate connections
+    results, start = [], threading.Barrier(6)
+
+    def tap(store, i):
+        start.wait()
+        results.append(store.decide_approval(t.id, a["id"], "approved" if i % 2 else "rejected",
+                                             f"staff {i}", f"u{i}", expected_version=1))
+    threads = [threading.Thread(target=tap, args=(st, i)) for i, st in enumerate(stores)]
+    [th.start() for th in threads]
+    [th.join() for th in threads]
+    winners = [r for r in results if r]
+    assert len(winners) == 1
+    final = tenants.get_approval(t.id, a["id"])
+    assert final["status"] == winners[0]["status"] and final["version"] == 2
+    assert [e["event"] for e in tenants.approval_events(t.id, a["id"])].count("requested") == 1
+    assert len(tenants.approval_events(t.id, a["id"])) == 2  # requested + exactly one decision
+    tenants.save_call_session("CA1", t.id, "cart1", {"phone": "+1"}, [{"role": "user", "content": "hi"}],
+                              {"hitl": True, "awaiting_approval": a["id"]})
+    assert tenants.load_call_session("CA1")["state"]["awaiting_approval"] == a["id"]

@@ -915,6 +915,181 @@ class TenantStore:
                        f"override:{override_id or kind}", None, {"cancelled": n})
         return n
 
+    # -- kitchen approvals (human in the loop) ------------------------------------
+    _APPROVAL_COLS = ("id, tenant_id, call_sid, cart_id, line_id, item_name, category,"
+                      " request_text, status, decision_note, decided_by, created_at,"
+                      " deadline_at, decided_at, relayed_at, version")
+
+    @staticmethod
+    def _approval_row(r) -> dict:
+        keys = ("id", "tenant_id", "call_sid", "cart_id", "line_id", "item_name", "category",
+                "request_text", "status", "decision_note", "decided_by", "created_at",
+                "deadline_at", "decided_at", "relayed_at", "version")
+        return dict(zip(keys, r))
+
+    def _approval_event(self, approval_id: str, tenant_id: str, actor_type: str, actor_id: str,
+                        event: str, detail: dict | None = None, now: float | None = None) -> None:
+        self._conn.execute(
+            "INSERT INTO approval_events (id, approval_id, tenant_id, at, actor_type, actor_id,"
+            " event, detail_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, approval_id, tenant_id, now if now is not None else time.time(),
+             actor_type, actor_id or "", event, json.dumps(redact(detail))))
+
+    def create_approval(self, tenant_id: str, call_sid: str, category: str, request_text: str,
+                        hold_seconds: float, cart_id: str = "", line_id: str = "",
+                        item_name: str = "", now: float | None = None) -> dict:
+        """Open a request for the kitchen. A repeat of the same pending request on
+        the same call (e.g. a retried webhook) returns the existing one."""
+        now = now if now is not None else time.time()
+        text = " ".join(str(request_text).split())[:300]
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._APPROVAL_COLS} FROM approval_requests WHERE call_sid = ?"
+                " AND tenant_id = ? AND status = 'pending' AND request_text = ?",
+                (call_sid, tenant_id, text)).fetchone()
+            if row:
+                return self._approval_row(row)
+            aid = uuid.uuid4().hex[:12]
+            with self._conn.transaction():
+                self._conn.execute(
+                    "INSERT INTO approval_requests (id, tenant_id, call_sid, cart_id, line_id,"
+                    " item_name, category, request_text, status, created_at, deadline_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    (aid, tenant_id, call_sid, cart_id, line_id, item_name[:80], category, text,
+                     now, now + hold_seconds))
+                self._approval_event(aid, tenant_id, "agent", call_sid, "requested",
+                                     {"category": category, "request": text}, now)
+        return self.get_approval(tenant_id, aid)
+
+    def get_approval(self, tenant_id: str, approval_id: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT {self._APPROVAL_COLS} FROM approval_requests WHERE id = ? AND tenant_id = ?",
+                (approval_id, tenant_id)).fetchone()
+        return self._approval_row(row) if row else None
+
+    def list_approvals(self, tenant_id: str, statuses: tuple[str, ...] | None = None,
+                       limit: int = 50) -> list[dict]:
+        q = f"SELECT {self._APPROVAL_COLS} FROM approval_requests WHERE tenant_id = ?"
+        params: list = [tenant_id]
+        if statuses:
+            q += f" AND status IN ({', '.join('?' for _ in statuses)})"
+            params += list(statuses)
+        q += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            rows = self._conn.execute(q, params).fetchall()
+        return [self._approval_row(r) for r in rows]
+
+    def approvals_for_call(self, call_sid: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT {self._APPROVAL_COLS} FROM approval_requests WHERE call_sid = ?"
+                " ORDER BY created_at", (call_sid,)).fetchall()
+        return [self._approval_row(r) for r in rows]
+
+    def decide_approval(self, tenant_id: str, approval_id: str, decision: str, note: str,
+                        actor_id: str, expected_version: int | None = None,
+                        now: float | None = None) -> dict | None:
+        """Staff decision. Atomic: only a still-pending request (at the version the
+        staff member saw, if given) and before its deadline can be decided, so two
+        people tapping at once produce one decision. Returns the request, or None
+        when it was already decided / expired / changed."""
+        from ..approvals import DECISIONS
+        if decision not in DECISIONS:
+            raise ValueError("decision must be approved, rejected or needs_info")
+        now = now if now is not None else time.time()
+        q = ("UPDATE approval_requests SET status = ?, decision_note = ?, decided_by = ?,"
+             " decided_at = ?, version = version + 1"
+             " WHERE id = ? AND tenant_id = ? AND status = 'pending' AND deadline_at > ?")
+        params: list = [decision, " ".join(str(note or "").split())[:300], actor_id, now,
+                        approval_id, tenant_id, now]
+        if expected_version is not None:
+            q += " AND version = ?"
+            params.append(int(expected_version))
+        with self._lock, self._conn.transaction():
+            if self._conn.execute(q, params).rowcount != 1:
+                return None
+            self._approval_event(approval_id, tenant_id, "user", actor_id, decision,
+                                 {"note": note}, now)
+        return self.get_approval(tenant_id, approval_id)
+
+    def expire_approval(self, tenant_id: str, approval_id: str, now: float | None = None) -> bool:
+        """Mark a pending request past its deadline as timed out (never approved)."""
+        now = now if now is not None else time.time()
+        with self._lock, self._conn.transaction():
+            n = self._conn.execute(
+                "UPDATE approval_requests SET status = 'timed_out', decided_at = ?,"
+                " version = version + 1 WHERE id = ? AND tenant_id = ? AND status = 'pending'"
+                " AND deadline_at <= ?", (now, approval_id, tenant_id, now)).rowcount
+            if n:
+                self._approval_event(approval_id, tenant_id, "system", "", "timed_out", None, now)
+        return n == 1
+
+    def cancel_approvals(self, call_sid: str, reason: str, line_id: str | None = None,
+                         now: float | None = None) -> int:
+        """Cancel a call's pending requests (caller hung up, or the item was removed)."""
+        now = now if now is not None else time.time()
+        pending = [a for a in self.approvals_for_call(call_sid) if a["status"] == "pending"
+                   and (line_id is None or a["line_id"] == line_id)]
+        n = 0
+        with self._lock, self._conn.transaction():
+            for a in pending:
+                if self._conn.execute(
+                        "UPDATE approval_requests SET status = 'cancelled', decided_at = ?,"
+                        " version = version + 1 WHERE id = ? AND status = 'pending'",
+                        (now, a["id"])).rowcount:
+                    self._approval_event(a["id"], a["tenant_id"], "system", "", "cancelled",
+                                         {"reason": reason}, now)
+                    n += 1
+        return n
+
+    def mark_approval_relayed(self, tenant_id: str, approval_id: str,
+                              now: float | None = None) -> bool:
+        """Record that the caller has been told the outcome; True only the first time."""
+        now = now if now is not None else time.time()
+        with self._lock:
+            n = self._conn.execute(
+                "UPDATE approval_requests SET relayed_at = ? WHERE id = ? AND tenant_id = ?"
+                " AND relayed_at IS NULL", (now, approval_id, tenant_id)).rowcount
+            self._conn.commit()
+        return n == 1
+
+    def approval_events(self, tenant_id: str, approval_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT at, actor_type, actor_id, event, detail_json FROM approval_events"
+                " WHERE approval_id = ? AND tenant_id = ? ORDER BY at", (approval_id, tenant_id)
+            ).fetchall()
+        return [{"at": r[0], "actor_type": r[1], "actor_id": r[2], "event": r[3],
+                 "detail": json.loads(r[4])} for r in rows]
+
+    # -- live call sessions (survive restarts) ------------------------------------
+    def save_call_session(self, call_sid: str, tenant_id: str, cart_id: str,
+                          caller: dict | None, history: list, state: dict | None = None) -> None:
+        with self._lock:
+            self._conn.upsert("call_sessions", {
+                "call_sid": call_sid, "tenant_id": tenant_id, "cart_id": cart_id,
+                "caller_json": json.dumps(caller), "history_json": json.dumps(history, default=str),
+                "state_json": json.dumps(state or {}), "updated_at": time.time()},
+                key=("call_sid",))
+            self._conn.commit()
+
+    def load_call_session(self, call_sid: str) -> dict | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT tenant_id, cart_id, caller_json, history_json, state_json, updated_at"
+                " FROM call_sessions WHERE call_sid = ?", (call_sid,)).fetchone()
+        if not row:
+            return None
+        return {"tenant_id": row[0], "cart_id": row[1], "caller": json.loads(row[2]),
+                "history": json.loads(row[3]), "state": json.loads(row[4]), "updated_at": row[5]}
+
+    def delete_call_session(self, call_sid: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM call_sessions WHERE call_sid = ?", (call_sid,))
+            self._conn.commit()
+
     # -- per-call routing record -------------------------------------------------
     def set_call_meta(self, call_sid: str, **values) -> None:
         """Merge values into the call's meta JSON (routing outcome, voicemail link)."""

@@ -212,6 +212,16 @@ textarea{min-height:150px;resize:vertical}
 .state .big{font-size:24px;font-weight:700}
 @media(max-width:860px){.sched{grid-template-columns:1fr}.sched .day{padding-top:0}}
 
+/* kitchen */
+.req{border:1px solid var(--line);border-radius:12px;background:#fff;padding:20px 22px;margin-bottom:16px}
+.req.allergy{border-color:#f3b49b;box-shadow:inset 4px 0 0 var(--bad)}
+.req .req-top{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.req .left{margin-left:auto;font-family:var(--mono);font-size:14px;font-weight:600}
+.req .left.low{color:var(--bad)}
+.req .what{font-size:20px;font-weight:600;margin:12px 0 4px}
+.req .acts{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+.btn.bad{background:var(--bad)}.btn.warn2{background:#8a5a00}
+
 /* charts */
 .legend{display:flex;gap:18px;font-size:14px;color:var(--mut)}
 .legend i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:middle}
@@ -276,6 +286,9 @@ _ICONS = {
              '<path d="M15 16v-4"/><path d="M19 16V8"/><path d="m7 9 4-4 4 3 5-5"/>',
     "bag": '<path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4Z"/><path d="M3 6h18"/>'
            '<path d="M16 10a4 4 0 0 1-8 0"/>',
+    "chef": '<path d="M17 21a1 1 0 0 0 1-1v-5.35c0-.457.316-.844.727-1.041a4 4 0 0 0-2.134-7.589 '
+            '5 5 0 0 0-9.186 0 4 4 0 0 0-2.134 7.588c.411.198.727.585.727 1.041V20a1 1 0 0 0 1 1Z"/>'
+            '<path d="M6 17h12"/>',
     "clock": '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
     "users": '<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/>'
              '<path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
@@ -319,6 +332,7 @@ NAV = [
     ("Command", [
         ("dash", "Dashboard", "/portal/", "grid"),
         ("stats", "Statistics", "/portal/statistics", "chart"),
+        ("kitchen", "Kitchen", "/portal/kitchen", "chef"),
         ("orders", "Orders", "/portal/orders", "bag"),
         ("customers", "Customers", "/portal/customers", "users"),
         ("calls", "Live calls", "/portal/calls", "phone"),

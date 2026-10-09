@@ -263,6 +263,6 @@ def test_invalid_schedules_are_rejected_and_kitchen_cannot_change_anything(tmp_p
     store.create_user(t.id, "cook@example.com", "password123", role="kitchen")
     cook = TestClient(app, follow_redirects=False)
     cook.post("/portal/login", data={"email": "cook@example.com", "password": "password123"})
-    assert cook.get("/portal/phone").headers["location"] == "/portal/orders"
+    assert cook.get("/portal/phone").headers["location"] == "/portal/kitchen"
     assert cook.post("/portal/api/voice-routing/stop", json={}).status_code == 403
     assert store.routing_config(t.id)[0].emergency_off is False

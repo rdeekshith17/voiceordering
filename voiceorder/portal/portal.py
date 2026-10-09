@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from ..tenants import crypto
+from .. import approvals as hitl
 from .. import routing
 from ..tenants import rbac
 from ..tenants.store import PortalUser, Tenant, TenantStore, normalize_number, real_transfer_number
@@ -150,7 +151,7 @@ _NAV_PERMISSION = {
     "dash": "reports.view", "stats": "reports.view", "orders": "orders.view",
     "customers": "customers.view", "calls": "calls.view", "pos": "pos.edit",
     "marketing": "reports.view", "usage": "reports.view", "support": "support.use",
-    "settings": "settings.edit", "phone": "settings.edit",
+    "settings": "settings.edit", "phone": "settings.edit", "kitchen": "approvals.decide",
 }
 
 # A call still marked live after this long without a turn lost its status webhook.
@@ -823,6 +824,144 @@ Use AI phone controls <span class="mut small" style="font-weight:400">(off = the
 <style>#controls.dim{{opacity:.45;pointer-events:none}}</style>
 <script>{_PHONE_JS.replace("__DATA__", json.dumps(v))}</script>"""
     return _page(deps, tenant, "phone", "AI phone", body)
+
+
+# --- Kitchen approvals (PR 3) ----------------------------------------------------------
+_CATEGORY_LABELS = {"custom_modification": "Custom change", "allergy": "Allergy",
+                    "availability": "Availability", "large_order": "Large order", "other": "Other"}
+
+
+def _approval_view(deps: PortalDeps, tenant: Tenant, a: dict, now: float) -> dict:
+    """What the kitchen sees: no customer phone numbers or names."""
+    call = deps.tenants.get_transcript(tenant.id, a["call_sid"]) or {}
+    live = call.get("status") == "live" and now - (call.get("updated_at") or 0) < _LIVE_STALE_SECONDS
+    return {"id": a["id"], "status": a["status"], "category": a["category"],
+            "category_label": _CATEGORY_LABELS.get(a["category"], a["category"]),
+            "item_name": a["item_name"], "request": a["request_text"], "note": a["decision_note"],
+            "version": a["version"], "seconds_left": max(0, int(a["deadline_at"] - now)),
+            "created_at": a["created_at"], "decided_at": a["decided_at"], "caller_on_line": live}
+
+
+_KITCHEN_JS = r"""
+const $ = s => document.querySelector(s);
+function esc(s){ const d=document.createElement('div'); d.textContent=s==null?'':String(s); return d.innerHTML; }
+let known = new Set(), first = true, sound = false, ctx = null;
+try { sound = localStorage.getItem('vo_kitchen_sound') === '1'; } catch(e) {}
+const sb = $('#sound'); sb.checked = sound;
+sb.onchange = () => { sound = sb.checked; try { localStorage.setItem('vo_kitchen_sound', sound?'1':'0'); } catch(e) {} if (sound) beep(); };
+function beep(){
+  try { ctx = ctx || new (window.AudioContext||window.webkitAudioContext)();
+    [0, .25].forEach(t => { const o=ctx.createOscillator(), g=ctx.createGain(); o.frequency.value=880;
+      g.gain.setValueAtTime(.25, ctx.currentTime+t); g.gain.exponentialRampToValueAtTime(.001, ctx.currentTime+t+.2);
+      o.connect(g); g.connect(ctx.destination); o.start(ctx.currentTime+t); o.stop(ctx.currentTime+t+.22); });
+  } catch(e) {}
+}
+function card(a){
+  const allergy = a.category === 'allergy';
+  return `<div class="req ${allergy?'allergy':''}" data-id="${esc(a.id)}">
+   <div class="req-top"><span class="pill ${allergy?'bad':'warn'}">${esc(a.category_label)}</span>
+   ${a.item_name?`<b>${esc(a.item_name)}</b>`:''}
+   <span class="mut small">${a.caller_on_line?'Caller on hold':'Caller left the line'}</span>
+   <span class="left ${a.seconds_left<=15?'low':''}" data-left="${a.seconds_left}">${a.seconds_left}s left</span></div>
+   <div class="what">${esc(a.request)}</div>
+   ${allergy?'<p class="small" style="color:var(--bad);margin:4px 0 0">Allergy: a note is required. Approving is not an allergen-safety guarantee.</p>':''}
+   <input class="note" maxlength="300" placeholder="${allergy?'Note for the caller (required)':'Note for the caller (optional)'}" style="margin-top:12px">
+   <div class="acts"><button class="btn" data-d="approved">Approve</button>
+   <button class="btn bad" data-d="rejected">Reject</button>
+   <button class="btn ghost" data-d="needs_info">Need more info</button></div></div>`;
+}
+async function decide(el, decision){
+  const id = el.dataset.id, a = window._pending[id];
+  const note = el.querySelector('.note').value.trim();
+  el.querySelectorAll('button').forEach(b => b.disabled = true);
+  const r = await fetch('/portal/api/approvals/'+encodeURIComponent(id)+'/decision', {method:'POST',
+    headers:{'Content-Type':'application/json'}, body: JSON.stringify({decision, note, expected_version: a.version})});
+  const j = await r.json().catch(()=>({}));
+  if (!r.ok) {
+    el.querySelectorAll('button').forEach(b => b.disabled = false);
+    el.querySelectorAll('.alert').forEach(x => x.remove());
+    const m = document.createElement('div'); m.className='alert bad'; m.textContent = j.detail || j.error || 'Could not save';
+    el.appendChild(m); el.dataset.hold = Date.now() + 5000;  // keep the card (and message) on screen
+    if (r.status === 409) setTimeout(load, 1500);
+    return;
+  }
+  load();
+}
+async function load(){
+  const r = await fetch('/portal/api/approvals'); if (!r.ok) return;
+  const j = await r.json();
+  window._pending = Object.fromEntries(j.pending.map(a => [a.id, a]));
+  const box = $('#pending');
+  // Keep cards someone is typing in; rebuild the rest.
+  const typing = document.activeElement && document.activeElement.classList.contains('note') ? document.activeElement.closest('.req') : null;
+  const showingError = [...document.querySelectorAll('.req')].some(c => +(c.dataset.hold || 0) > Date.now());
+  if (!typing && !showingError) {
+    box.innerHTML = j.pending.length ? j.pending.map(card).join('') : '<div class="card"><div class="empty">No requests right now. New ones appear here instantly.</div></div>';
+    box.querySelectorAll('.req').forEach(el => el.querySelectorAll('[data-d]').forEach(b => b.onclick = () => decide(el, b.dataset.d)));
+  }
+  const fresh = j.pending.filter(a => !known.has(a.id));
+  if (!first && fresh.length && sound) beep();
+  j.pending.forEach(a => known.add(a.id)); first = false;
+  $('#count').textContent = j.pending.length;
+  $('#recent').innerHTML = j.recent.map(a => `<div class="rank" style="padding:14px 0;align-items:center;gap:14px"><div><b>${esc(a.request)}</b>
+    <div class="mut small">${esc(a.category_label)}${a.note?' · “'+esc(a.note)+'”':''}</div></div>
+    <span class="pill ${a.status==='approved'?'ok':a.status==='rejected'?'bad':''}">${esc(a.status.replace('_',' '))}</span></div>`).join('')
+    || '<p class="mut">Nothing yet.</p>';
+}
+setInterval(() => document.querySelectorAll('[data-left]').forEach(e => {
+  const v = Math.max(0, +e.dataset.left - 1); e.dataset.left = v; e.textContent = v + 's left'; e.classList.toggle('low', v <= 15); }), 1000);
+load(); setInterval(load, 2000);
+"""
+
+_KITCHEN_SETTINGS_JS = r"""
+document.getElementById('hitl-form').addEventListener('submit', async e => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {enabled: f.enabled.checked, hold_seconds: +f.hold_seconds.value,
+                large_order_total: +(f.large_order_total.value || 0), on_timeout: f.on_timeout.value};
+  const r = await fetch('/portal/api/approvals/settings', {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const j = await r.json().catch(()=>({}));
+  const m = document.getElementById('hitl-msg'); m.innerHTML = '<div class="alert ' + (r.ok?'ok':'bad') + '"></div>';
+  m.firstChild.textContent = r.ok ? 'Saved.' : (j.error || 'Save failed');
+});
+"""
+
+
+def _kitchen_page(deps: PortalDeps, tenant: Tenant) -> str:
+    enabled = deps.tenants.flag_enabled(tenant.id, "hitl_enabled")
+    settings_card = ""
+    if rbac.can(_viewer_role.get(), "settings.edit"):
+        pol = hitl.ApprovalPolicy.from_settings(tenant.settings)
+        timeout_opts = "".join(
+            f'<option value="{k}"{" selected" if pol.on_timeout == k else ""}>{l}</option>'
+            for k, l in (("offer_transfer", "Offer to transfer to staff, drop the request, or continue"),
+                         ("drop_request", "Continue the order without the request")))
+        settings_card = f"""<form id="hitl-form" class="card card-b" style="margin-top:28px">
+<h3 class="sec-h" style="margin-bottom:6px">Approval settings</h3><div id="hitl-msg"></div>
+<label class="switch" style="margin-top:10px"><input type="checkbox" name="enabled"{' checked' if enabled else ''}>
+Ask the kitchen during calls</label>
+<label class="f" style="margin-top:16px">Hold time (seconds)</label>
+<input type="number" name="hold_seconds" min="20" max="180" value="{pol.hold_seconds}">
+<p class="help">How long a caller waits for an answer. No answer is never treated as a yes.</p>
+<label class="f" style="margin-top:16px">Large orders need approval above ($)</label>
+<input type="number" name="large_order_total" min="0" step="1" value="{pol.large_order_total:g}" placeholder="0 = never">
+<label class="f" style="margin-top:16px">If the kitchen doesn't answer in time</label>
+<select name="on_timeout">{timeout_opts}</select>
+<div class="actions" style="margin-top:18px"><button class="btn ghost" type="submit">{icon("save", 18)}Save</button></div></form>
+<script>{_KITCHEN_SETTINGS_JS}</script>"""
+    off_note = ("" if enabled else
+                '<div class="alert warn">Kitchen approvals are off, so the AI won\'t send requests here yet. '
+                + ("Turn them on in Approval settings below.</div>" if settings_card else "Ask your admin to turn them on.</div>"))
+    body = _page_head("Kitchen", "Requests the AI needs a person to confirm while the caller holds.") + f"""
+{off_note}
+<div class="grid-main"><div><div class="row-between" style="margin-bottom:16px">
+<h3 class="sec-h" style="margin:0">Waiting for you <span class="pill warn" id="count">0</span></h3>
+<label class="switch small"><input type="checkbox" id="sound"> Sound alert</label></div>
+<div id="pending"><div class="card"><div class="empty">Loading…</div></div></div></div>
+<div><h3 class="sec-h">Recent decisions</h3><div class="card"><div class="card-b" id="recent"
+ style="padding-top:4px;padding-bottom:4px"></div></div>{settings_card}</div></div>
+<script>{_KITCHEN_JS}</script>"""
+    return _page(deps, tenant, "kitchen", "Kitchen", body)
 
 
 def _customers_page(deps: PortalDeps, tenant: Tenant) -> str:
@@ -1603,6 +1742,72 @@ def build_portal_router(deps: PortalDeps) -> APIRouter:
         user, tenant = api_user(request, "settings.edit")
         if not deps.tenants.cancel_routing_overrides(tenant.id, user.id, override_id=override_id):
             raise HTTPException(status_code=404, detail="exception not found")
+        return {"ok": True}
+
+    @router.get("/portal/kitchen", response_class=HTMLResponse)
+    async def kitchen_page(request: Request):
+        res = page_user(request, "approvals.decide")
+        if isinstance(res, RedirectResponse):
+            return res
+        _, tenant = res
+        return _kitchen_page(deps, tenant)
+
+    @router.get("/portal/api/approvals")
+    async def api_approvals(request: Request):
+        _, tenant = api_user(request, "approvals.decide")
+        now = time.time()
+        pending = deps.tenants.list_approvals(tenant.id, ("pending",), 50)
+        for a in pending:  # anything past its deadline is a timeout, not a pending request
+            if a["deadline_at"] <= now:
+                deps.tenants.expire_approval(tenant.id, a["id"], now=now)
+        pending = [a for a in deps.tenants.list_approvals(tenant.id, ("pending",), 50)]
+        recent = deps.tenants.list_approvals(
+            tenant.id, ("approved", "rejected", "needs_info", "timed_out", "cancelled"), 15)
+        return {"pending": [_approval_view(deps, tenant, a, now) for a in reversed(pending)],
+                "recent": [_approval_view(deps, tenant, a, now) for a in recent]}
+
+    @router.post("/portal/api/approvals/{approval_id}/decision")
+    async def api_approval_decision(request: Request, approval_id: str):
+        user, tenant = api_user(request, "approvals.decide")
+        body = await request.json()
+        decision, note = str(body.get("decision", "")), str(body.get("note", "")).strip()
+        current = deps.tenants.get_approval(tenant.id, approval_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="request not found")
+        if current["category"] == "allergy" and decision in ("approved", "rejected") and not note:
+            raise HTTPException(status_code=400, detail="allergy decisions need a note for the caller")
+        try:
+            done = deps.tenants.decide_approval(tenant.id, approval_id, decision, note, user.id,
+                                                expected_version=body.get("expected_version"))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if done is None:
+            raise HTTPException(status_code=409, detail="already decided, expired, or cancelled")
+        return {"ok": True, "status": done["status"]}
+
+    @router.put("/portal/api/approvals/settings")
+    async def api_approval_settings(request: Request):
+        user, tenant = api_user(request, "settings.edit")
+        body = await request.json()
+        try:
+            hold = int(body.get("hold_seconds", 60))
+            large = float(body.get("large_order_total", 0) or 0)
+        except (TypeError, ValueError):
+            return JSONResponse({"ok": False, "error": "numbers only"}, status_code=400)
+        if not 20 <= hold <= 180 or large < 0:
+            return JSONResponse({"ok": False, "error": "hold time must be 20-180 seconds"},
+                                status_code=400)
+        on_timeout = str(body.get("on_timeout", "offer_transfer"))
+        if on_timeout not in hitl.ON_TIMEOUT:
+            return JSONResponse({"ok": False, "error": "unknown timeout option"}, status_code=400)
+        values = {"approvals_hold_seconds": str(hold), "approvals_large_order_total": f"{large:g}",
+                  "approvals_on_timeout": on_timeout}
+        before = {k: tenant.settings.get(k, "") for k in values}
+        deps.tenants.set_settings(tenant.id, values)
+        deps.tenants.audit("user", user.id, tenant.id, "approvals.settings", "approvals", before, values)
+        enabled = bool(body.get("enabled"))
+        if enabled != deps.tenants.flag_enabled(tenant.id, "hitl_enabled"):
+            deps.tenants.set_flag(tenant.id, "hitl_enabled", enabled, actor=user.id)
         return {"ok": True}
 
     @router.get("/portal/customers", response_class=HTMLResponse)

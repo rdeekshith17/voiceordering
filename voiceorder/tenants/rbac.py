@@ -34,7 +34,9 @@ def can(role: str | None, permission: str) -> bool:
 
 def home_page(role: str | None) -> str:
     """Where a user lands after login: the first page their role can open."""
-    return "/portal/" if can(role, "reports.view") else "/portal/orders"
+    if can(role, "reports.view"):
+        return "/portal/"
+    return "/portal/kitchen" if can(role, "approvals.decide") else "/portal/orders"
 
 
 # -- platform roles ------------------------------------------------------------

@@ -68,16 +68,16 @@ def test_admin_keeps_full_access_and_sees_every_page(tmp_path):
     assert owner.post("/portal/api/settings", json={"pickup_minutes": "25"}).json()["ok"]
 
 
-def test_kitchen_staff_only_reach_orders(tmp_path):
+def test_kitchen_staff_only_reach_kitchen_and_orders(tmp_path):
     app, store, tenant, _ = _portal(tmp_path)
     store.create_user(tenant.id, "cook@example.com", "password123", role="kitchen")
     cook, r = _login(app, "cook@example.com")
-    assert r.headers["location"] == "/portal/orders"
+    assert r.headers["location"] == "/portal/kitchen"
     orders = cook.get("/portal/orders")
-    assert orders.status_code == 200
+    assert orders.status_code == 200 and cook.get("/portal/kitchen").status_code == 200
     assert "/portal/settings" not in orders.text and "/portal/pos" not in orders.text
     for page in ("/portal/", "/portal/settings", "/portal/pos", "/portal/customers"):
-        assert cook.get(page).headers["location"] == "/portal/orders", page
+        assert cook.get(page).headers["location"] == "/portal/kitchen", page
     assert cook.post("/portal/api/settings", json={"pickup_minutes": "5"}).status_code == 403
     assert cook.get("/portal/api/pos").status_code == 403
     assert store.get_tenant(tenant.id).setting("pickup_minutes", "") != "5"
