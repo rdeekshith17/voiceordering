@@ -1516,21 +1516,20 @@ class CallEndRequest(BaseModel):
 _APP_STARTED_AT = time.time()
 
 
+_SITE_DIR = Path(__file__).resolve().parent.parent / "site"
+_LANDING_HTML = (_SITE_DIR / "landing.html").read_text(encoding="utf-8")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index() -> str:
-    return """<!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>VoiceOrderAI</title>
-<style>body{font-family:system-ui,sans-serif;max-width:640px;margin:3em auto;
-padding:0 1em;color:#222}h1{font-size:1.6em}a.btn{display:inline-block;margin:.4em .6em .4em 0;
-padding:.7em 1.2em;background:#1a73e8;color:#fff;border-radius:8px;text-decoration:none}
-a.btn.alt{background:#5f6368}p{color:#555}</style></head><body>
-<h1>🎙️ VoiceOrderAI</h1>
-<p>AI phone ordering for restaurants. Manage your restaurant below, or try the text demo.</p>
-<a class="btn" href="/portal/login">Restaurant portal</a>
-<a class="btn alt" href="/owner">Owner dashboard</a>
-""" + ('<a class="btn alt" href="/chat">Text demo</a>' if _chat_enabled() else "") + """
-</body></html>"""
+    """Public marketing page (demo-request form + restaurant/admin login links)."""
+    return _LANDING_HTML
+
+
+@app.get("/assets/restaurant-kitchen.jpg")
+def landing_hero_image() -> FileResponse:
+    return FileResponse(_SITE_DIR / "restaurant-kitchen.jpg", media_type="image/jpeg",
+                        headers={"Cache-Control": "public, max-age=604800"})
 
 
 @app.get("/health")
