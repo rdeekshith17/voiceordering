@@ -1,0 +1,361 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>VoiceOrderAI — Never miss another phone order.</title>
+<meta name="description" content="AI voice ordering for restaurants. Answer every call, take every order, and send it to your POS and kitchen, 24/7.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=Manrope:wght@500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --primary:#3b9d48; --primary-ink:#2e7d39; --primary-soft:#e5f2e6; --primary-line:#b9dcbd;
+  --bg:#f5f6f5; --bg-green:#eaefea; --card:#fff; --line:#e3e6e3; --txt:#1c1f1c; --mut:#646a64;
+  --head:"Manrope",system-ui,sans-serif; --body:"DM Sans",system-ui,sans-serif;
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+@supports (color: oklch(0 0 0)){
+  :root{--primary:oklch(0.629 0.154 144.2);--bg:oklch(0.975 0.002 145);--txt:oklch(0.23 0.004 145)}
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:90px}
+body{margin:0;background:var(--bg);color:var(--txt);font:16px/1.6 var(--body);-webkit-font-smoothing:antialiased}
+a{color:inherit;text-decoration:none}
+h1,h2,h3{font-family:var(--head);margin:0;letter-spacing:-.02em}
+.wrap{max-width:1160px;margin:0 auto;padding:0 24px}
+.eyebrow{display:flex;align-items:center;gap:10px;font:600 11.5px/1 var(--body);letter-spacing:.22em;
+  text-transform:uppercase;color:var(--primary)}
+.eyebrow.center{justify-content:center}
+.eyebrow::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--primary)}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;height:48px;padding:0 30px;border-radius:6px;
+  font:500 15px var(--body);border:1px solid var(--primary);cursor:pointer;transition:filter .15s,background .15s}
+.btn.solid{background:var(--primary);color:#fff}
+.btn.solid:hover{filter:brightness(.94)}
+.btn.outline{background:#fff;color:var(--primary-ink)}
+.btn.outline:hover{background:var(--primary-soft)}
+.btn.sm{height:40px;padding:0 20px;font-size:14px}
+.btn svg{width:16px;height:16px}
+
+/* header */
+header{position:sticky;top:0;z-index:20;background:rgba(245,246,245,.88);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+header .wrap{display:flex;align-items:center;height:83px;gap:24px}
+.logo{display:flex;align-items:center;gap:10px;font:600 21px var(--head);letter-spacing:-.02em}
+.logo b{color:var(--primary);font-weight:600}
+.logo svg{width:28px;height:30px;color:var(--primary)}
+nav.links{display:flex;gap:32px;margin:0 auto;font-size:14px}
+nav.links a{color:var(--primary-ink)}
+nav.links a:hover{color:var(--txt)}
+.head-acts{display:flex;gap:8px}
+
+/* hero */
+.hero{position:relative;overflow:hidden;border-bottom:1px solid var(--line)}
+.hero-bg{position:absolute;inset:0}
+.hero-bg img{width:100%;height:100%;object-fit:cover;filter:grayscale(1);opacity:.42}
+.hero-bg::after{content:"";position:absolute;inset:0;
+  background:linear-gradient(90deg,var(--bg) 0%,rgba(245,246,245,.92) 34%,rgba(245,246,245,.35) 70%,rgba(245,246,245,.55) 100%),
+             linear-gradient(0deg,var(--bg) 0%,rgba(245,246,245,0) 30%)}
+.hero .wrap{position:relative;display:grid;grid-template-columns:1.15fr .85fr;gap:48px;align-items:center;padding-top:76px;padding-bottom:104px}
+.hero h1{font-family:var(--body);font-weight:500;font-size:clamp(44px,6vw,68px);line-height:1.08;margin:30px 0 30px}
+.hero h1 span{color:var(--primary)}
+.hero p.lede{font-size:17px;color:var(--mut);max-width:520px;margin:0 0 36px;line-height:1.75}
+.hero .ctas{display:flex;gap:12px;flex-wrap:wrap}
+.hero .ctas .btn{height:48px;min-width:206px}
+.assure{display:flex;align-items:center;gap:10px;margin-top:20px;font-size:12px;color:var(--mut)}
+.assure svg{width:15px;height:15px;color:var(--primary)}
+
+.call{background:#fff;border:1px solid var(--line);border-radius:8px;box-shadow:0 18px 50px rgba(20,40,20,.10);overflow:hidden}
+.call-top{display:flex;justify-content:space-between;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line);font-size:13px}
+.call-top .live{display:flex;align-items:center;gap:8px}
+.call-top .live::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--primary);animation:pulse 1.6s infinite}
+.call-top time{font:12px var(--mono);color:#444}
+.call-body{padding:20px 24px 22px}
+.call-who{display:flex;gap:14px;align-items:center}
+.call-who .ic{width:40px;height:40px;border-radius:50%;background:var(--primary-soft);color:var(--primary);display:grid;place-items:center}
+.call-who .ic svg{width:17px;height:17px}
+.call-who b{display:block;font-size:14px;font-weight:600}
+.call-who span{font-size:11px;color:var(--mut)}
+.wave{display:flex;align-items:center;gap:3px;height:28px;margin:22px 0 18px}
+.wave i{flex:1;max-width:3px;background:var(--primary);border-radius:2px;opacity:.75;animation:wave 1.2s ease-in-out infinite}
+.say{font-size:12px;color:#333}
+.say em{font-style:normal;color:var(--mut)}
+.reply{margin-top:14px;background:var(--bg-green);border-radius:4px;padding:12px 14px;font-size:12px;line-height:1.65}
+.reply small{display:block;font:600 9.5px var(--body);letter-spacing:.06em;color:var(--primary);margin-bottom:4px}
+.call-foot{display:flex;justify-content:space-between;padding:12px 20px;border-top:1px solid var(--line);font-size:10.5px}
+.call-foot span:first-child{color:var(--primary-ink)}
+@keyframes wave{0%,100%{transform:scaleY(.35)}50%{transform:scaleY(1)}}
+@keyframes pulse{50%{opacity:.35}}
+
+.stats{border-bottom:1px solid var(--line)}
+.stats .wrap{display:grid;grid-template-columns:repeat(3,1fr);padding-top:30px;padding-bottom:30px}
+.stat{display:flex;gap:16px;align-items:center;padding:0 20px}
+.stat:first-child{padding-left:0}
+.stat:not(:first-child){border-left:1px solid var(--line);justify-content:center}
+.stat:last-child{justify-content:flex-end;padding-right:0}
+.stat svg{width:22px;height:22px;color:var(--primary);flex:none}
+.stat b{font:600 17px var(--head)}
+.stat b small{font:400 14px var(--body);color:var(--mut)}
+.stat p{margin:2px 0 0;font-size:11.5px;color:var(--mut)}
+
+/* sections */
+section.block{padding:96px 0;border-bottom:1px solid var(--line)}
+.section-title{font-size:clamp(30px,4vw,40px);line-height:1.2;font-weight:600}
+.section-copy{color:var(--mut);font-size:15px}
+.center{text-align:center}
+
+.steps{display:grid;grid-template-columns:repeat(3,1fr);gap:32px;margin-top:56px}
+.step{border-top:1px solid var(--line);padding-top:24px}
+.step .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:26px}
+.step .num{width:28px;height:28px;border-radius:50%;border:1px solid var(--primary-line);color:var(--primary);display:grid;place-items:center;font:600 10px var(--mono)}
+.step .top svg{width:18px;height:18px;color:var(--primary)}
+.step h3{font-size:17px;font-weight:600;margin-bottom:12px}
+.step p{margin:0;color:var(--mut);font-size:14px}
+
+.feat-head{display:flex;justify-content:space-between;align-items:flex-end;gap:32px;flex-wrap:wrap;margin-bottom:46px}
+.feat-head > p{margin:0;color:var(--mut);font-size:15px;line-height:1.8}
+.features{display:grid;grid-template-columns:repeat(4,1fr);gap:16px}
+.feature{background:#fff;border:1px solid var(--line);border-radius:3px;padding:28px 26px 30px}
+.feature svg{width:20px;height:20px;color:var(--primary)}
+.feature h3{font:500 15px var(--body);letter-spacing:0;margin:24px 0 14px}
+.feature p{margin:0;font-size:12.5px;line-height:1.8;color:var(--mut)}
+
+.demo{background:var(--bg-green)}
+.demo .note{display:flex;justify-content:center;align-items:center;gap:8px;font-size:12px;color:var(--mut);margin-top:24px}
+.demo .note svg{width:16px;height:16px;color:var(--primary)}
+.form-card{max-width:720px;margin:44px auto 0;background:#fff;border:1px solid var(--line);border-radius:6px;padding:12px 36px;
+  box-shadow:0 24px 70px rgba(20,40,20,.10)}
+.form-card iframe{display:block;width:100%;height:1500px;border:0}
+.form-card .fallback{text-align:center;font-size:12.5px;color:var(--mut);padding:10px 0 4px}
+.form-card .fallback a{color:var(--primary-ink);text-decoration:underline}
+
+.cost .wrap{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:start}
+.cost h2{margin:18px 0 22px}
+.cost p{color:var(--mut);font-size:15px;margin:0 0 22px}
+.cost .strong{color:var(--txt);font-weight:500}
+.figures{border-top:1px solid var(--line)}
+.fig{display:grid;grid-template-columns:120px 1fr;gap:20px;padding:20px 0;border-bottom:1px solid var(--line);align-items:center}
+.fig .n{font:600 28px var(--head);color:var(--primary)}
+.fig .n.dark{color:var(--txt)}
+.fig b{font-weight:500;font-size:14px}
+.fig p{margin:2px 0 0;font-size:12.5px}
+.disclaim{font-size:11px;color:var(--mut);margin-top:14px}
+
+.final{background:var(--bg-green);text-align:center}
+.final h2{margin:18px 0 14px}
+.final p{color:var(--mut);margin:0 0 30px}
+
+footer .wrap{padding-top:40px;padding-bottom:40px}
+.foot-top{display:flex;justify-content:space-between;align-items:center;gap:24px;flex-wrap:wrap;padding-bottom:36px}
+.foot-top nav{display:flex;gap:30px;font-size:13px;color:var(--primary-ink)}
+.foot-bot{display:flex;justify-content:space-between;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--mut)}
+.foot-bot nav{display:flex;gap:24px}
+.foot-bot nav a:hover,.foot-top nav a:hover{color:var(--txt)}
+
+@media(max-width:960px){
+  nav.links{display:none}
+  .head-acts{margin-left:auto}
+  .hero .wrap{grid-template-columns:1fr;padding-top:48px;padding-bottom:64px}
+  .steps{grid-template-columns:1fr}
+  .features{grid-template-columns:repeat(2,1fr)}
+  .cost .wrap{grid-template-columns:1fr;gap:32px}
+}
+@media(max-width:600px){
+  .wrap{padding:0 16px}
+  header .wrap{height:68px}
+  .logo{font-size:18px}
+  .head-acts .book{display:none}
+  .stats .wrap{grid-template-columns:1fr;gap:18px}
+  .stat,.stat:not(:first-child),.stat:last-child{justify-content:flex-start;border:0;padding:0}
+  .features{grid-template-columns:1fr}
+  section.block{padding:64px 0}
+  .form-card{padding:8px 4px}
+  .form-card iframe{height:1700px}
+  .hero .ctas .btn{width:100%}
+  .fig{grid-template-columns:96px 1fr}
+}
+@media(prefers-reduced-motion:reduce){.wave i,.call-top .live::before{animation:none}html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <a class="logo" href="/" aria-label="VoiceOrderAI home">
+      <svg viewBox="0 0 28 30" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M3 11v8M9 5v20M15 9v12M21 3v24M27 12v6"/></svg>
+      <span>VoiceOrder<b>AI</b></span>
+    </a>
+    <nav class="links" aria-label="Main">
+      <a href="#how-it-works">How it works</a>
+      <a href="#features">Features</a>
+      <a href="#live-demo">Live demo</a>
+    </nav>
+    <div class="head-acts">
+      <a class="btn outline sm" href="/portal/login">Log in</a>
+      <a class="btn solid sm book" href="#live-demo">Book a demo
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 17 17 7M7 7h10v10"/></svg></a>
+    </div>
+  </div>
+</header>
+
+<main>
+<section class="hero">
+  <div class="hero-bg"><img src="/assets/restaurant-kitchen.jpg" alt="Chefs preparing dinner orders in a busy restaurant kitchen"></div>
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">Your next best hire isn’t human.</p>
+      <h1>Never miss<br>another<br><span>phone order.</span></h1>
+      <p class="lede">VoiceOrderAI answers every call in a natural human voice, takes the order, and sends it straight to your POS and kitchen — 24/7, even during the dinner rush.</p>
+      <div class="ctas">
+        <a class="btn solid" href="#live-demo">Hear a live demo</a>
+        <a class="btn outline" href="#live-demo">Book a demo
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></a>
+      </div>
+      <p class="assure"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>Built for restaurants. Ready for the rush.</p>
+    </div>
+    <div class="call" aria-label="Example call">
+      <div class="call-top"><span class="live">Live call in progress</span><time>00:42</time></div>
+      <div class="call-body">
+        <div class="call-who">
+          <span class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2z"/></svg></span>
+          <div><b>One call. One happy customer.</b><span>VoiceOrderAI · Taking an order</span></div>
+        </div>
+        <div class="wave" aria-hidden="true" id="wave"></div>
+        <p class="say">Customer &nbsp; <em>“One margherita pizza, extra basil, please.”</em></p>
+        <div class="reply"><small>VOICEORDERAI</small>“Of course! One margherita with extra basil. Anything else I can get for you?”</div>
+      </div>
+      <div class="call-foot"><span>✓ &nbsp;Order captured</span><span>Ready for kitchen approval</span></div>
+    </div>
+  </div>
+</section>
+
+<section class="stats" aria-label="At a glance">
+  <div class="wrap">
+    <div class="stat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2z"/></svg>
+      <div><b>100% <small>of calls answered</small></b><p>Every ring. Every time.</p></div></div>
+    <div class="stat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg>
+      <div><b>Under 60 seconds</b><p>From hello to order placed.</p></div></div>
+    <div class="stat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5M9 8V2M15 8V2M18 8v5a6 6 0 0 1-12 0V8z"/></svg>
+      <div><b>Square, Toast &amp; Clover</b><p>Your POS. Seamlessly connected.</p></div></div>
+  </div>
+</section>
+
+<section class="block" id="how-it-works">
+  <div class="wrap">
+    <div class="center">
+      <p class="eyebrow center">From first ring to kitchen</p>
+      <h2 class="section-title" style="margin-top:16px">Three steps. Zero missed orders.</h2>
+      <p class="section-copy" style="margin:12px 0 0">You focus on the food. We’ll handle the phone.</p>
+    </div>
+    <div class="steps">
+      <div class="step"><div class="top"><span class="num">01</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 16.9v3a2 2 0 0 1-2.2 2 19.8 19.8 0 0 1-8.6-3.1 19.5 19.5 0 0 1-6-6A19.8 19.8 0 0 1 2.1 4.2 2 2 0 0 1 4.1 2h3a2 2 0 0 1 2 1.7c.1 1 .4 1.9.7 2.8a2 2 0 0 1-.5 2.1L8.1 9.9a16 16 0 0 0 6 6l1.3-1.3a2 2 0 0 1 2.1-.4c.9.3 1.8.6 2.8.7a2 2 0 0 1 1.7 2z"/></svg></div>
+        <h3>Every call gets a hello.</h3><p>The AI answers instantly, every time. No hold music. No voicemail. Just a friendly voice, ready to help.</p></div>
+      <div class="step"><div class="top"><span class="num">02</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M2 10v3M6 6v11M10 3v18M14 8v7M18 5v13M22 10v3"/></svg></div>
+        <h3>A conversation, not a script.</h3><p>It takes the order, handles customizations, answers questions about specials, and reads everything back.</p></div>
+      <div class="step"><div class="top"><span class="num">03</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="m9 14 2 2 4-4"/></svg></div>
+        <h3>Straight to your kitchen.</h3><p>The order lands in your POS and kitchen for one-tap approval. Your team stays focused. Dinner stays on track.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="block" id="features">
+  <div class="wrap">
+    <div class="feat-head">
+      <div><p class="eyebrow">More than an answering service</p>
+        <h2 class="section-title" style="margin-top:16px">A little AI. A lot off your plate.</h2></div>
+      <p>Everything your phone orders need.<br>Nothing your team doesn’t.</p>
+    </div>
+    <div class="features">
+      <div class="feature"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M2 10v3M6 6v11M10 3v18M14 8v7M18 5v13M22 10v3"/></svg>
+        <h3>A voice that feels human</h3><p>Warm, natural conversations. No robotic menus, awkward pauses, or “press one.”</p></div>
+      <div class="feature"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m16 2-2.3 2.3a3 3 0 0 0 0 4.2l1.8 1.8a3 3 0 0 0 4.2 0L22 8"/><path d="M15 15 3.3 3.3a4.2 4.2 0 0 0 0 6l7.3 7.3c.7.7 2 .7 2.8 0L15 15zm0 0 7 7"/><path d="m2.1 21.8 6.4-6.3"/><path d="m19 5-7 7"/></svg>
+        <h3>Knows your menu inside out</h3><p>Every dish, price, special, and customization. Your menu, always on the tip of its tongue.</p></div>
+      <div class="feature"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5M9 8V2M15 8V2M18 8v5a6 6 0 0 1-12 0V8z"/></svg>
+        <h3>Your POS. Already connected.</h3><p>Orders go straight to Square, Toast, or Clover. No retyping. No extra screens.</p></div>
+      <div class="feature"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><path d="m9 14 2 2 4-4"/></svg>
+        <h3>Your kitchen stays in control</h3><p>Review incoming orders and approve with one tap. Nothing slips through the cracks.</p></div>
+      <div class="feature"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+        <h3>A clear view of every call</h3><p>Live calls, full transcripts, and order analytics. See exactly what’s happening.</p></div>
+      <div class="feature"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M12 2v10"/><path d="M18.4 6.6a9 9 0 1 1-12.8 0"/></svg>
+        <h3>On when you need it</h3><p>Turn AI answering on or off for each location. You’re always in the driver’s seat.</p></div>
+      <div class="feature"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <h3>An instant “you’re all set”</h3><p>Customers get an SMS confirmation with their order details. Less uncertainty, fewer callbacks.</p></div>
+      <div class="feature"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="10" cy="8" r="5"/><path d="M2 21a8 8 0 0 1 12.4-6.7"/><path d="m16 19 2 2 4-4"/></svg>
+        <h3>Remembers your regulars</h3><p>A familiar “welcome back” for returning callers. A little recognition goes a long way.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="block demo" id="live-demo">
+  <div class="wrap">
+    <div class="center">
+      <p class="eyebrow center">The proof is on the phone</p>
+      <h2 class="section-title" style="margin-top:16px">Don’t take our word for it.<br>Take it for a call.</h2>
+      <p class="section-copy" style="max-width:520px;margin:20px auto 0">See the AI take a real order — menu questions, substitutions and all. Book a live demo and we’ll walk your team through it.</p>
+      <p class="note"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 14h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-7a9 9 0 0 1 18 0v7a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3"/></svg>A real AI conversation. Not a recording.</p>
+    </div>
+    <div class="form-card">
+      <iframe title="Request a demo — VoiceOrderAI" loading="lazy"
+        src="https://docs.google.com/forms/d/e/1FAIpQLSf2jMcnpTwexRMsyiFk7GGaLuMTi0HND96qx59a5ftiA3-0ag/viewform?embedded=true">Loading…</iframe>
+      <p class="fallback">Form not showing? <a href="https://docs.google.com/forms/d/e/1FAIpQLSf2jMcnpTwexRMsyiFk7GGaLuMTi0HND96qx59a5ftiA3-0ag/viewform" target="_blank" rel="noopener">Open it in a new tab</a>.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block cost">
+  <div class="wrap">
+    <div>
+      <p class="eyebrow">The cost of “we’ll call back”</p>
+      <h2 class="section-title">Every missed call<br>is missed revenue.</h2>
+      <p>When the phone rings and no one picks up, a hungry customer doesn’t wait. They call the next restaurant. Those small moments add up to a big hole in your bottom line.</p>
+      <p class="strong">Keep your team on the floor. Keep your orders coming in.</p>
+    </div>
+    <div>
+      <div class="figures">
+        <div class="fig"><span class="n">5</span><div><b>Missed orders a day</b><p class="section-copy">A few busy moments can make all the difference.</p></div></div>
+        <div class="fig"><span class="n dark">$30</span><div><b>Per average order</b><p class="section-copy">Dinner for two. Revenue you shouldn’t lose.</p></div></div>
+        <div class="fig"><span class="n">$4,500</span><div><b>Potential revenue lost per month</b><p class="section-copy">Orders that could have reached your kitchen.</p></div></div>
+      </div>
+      <p class="disclaim">Illustrative estimate: 5 missed orders × $30 × 30 days. Actual results depend on your call volume and order value.</p>
+    </div>
+  </div>
+</section>
+
+<section class="block final">
+  <div class="wrap">
+    <p class="eyebrow center">Your phone’s next chapter</p>
+    <h2 class="section-title">More orders. Less ringing.<br>A better night for everyone.</h2>
+    <p>Give every caller a seat at your table.</p>
+    <a class="btn solid" href="#live-demo">Let’s talk about your restaurant
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M7 17 17 7M7 7h10v10"/></svg></a>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-top">
+      <a class="logo" href="/"><svg viewBox="0 0 28 30" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M3 11v8M9 5v20M15 9v12M21 3v24M27 12v6"/></svg><span>VoiceOrder<b>AI</b></span></a>
+      <nav aria-label="Footer"><a href="#how-it-works">How it works</a><a href="#features">Features</a><a href="#live-demo">Live demo</a></nav>
+    </div>
+    <div class="foot-bot">
+      <span>© 2026 VoiceOrderAI. All rights reserved.</span>
+      <nav aria-label="Logins"><a href="/portal/login">Restaurant login</a><a href="/admin/login">Admin login</a></nav>
+      <span>Every call. Every order. Every day.</span>
+    </div>
+  </div>
+</footer>
+
+<script>
+// Animated waveform bars in the example call card.
+(function(){
+  var w = document.getElementById('wave'); if (!w) return;
+  var html = '';
+  for (var i = 0; i < 52; i++) {
+    var h = 25 + Math.round(Math.abs(Math.sin(i * 1.7)) * 75);
+    html += '<i style="height:' + h + '%;animation-delay:' + (i % 9) * 0.11 + 's"></i>';
+  }
+  w.innerHTML = html;
+})();
+</script>
+</body>
+</html>
