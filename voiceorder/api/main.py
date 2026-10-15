@@ -1531,6 +1531,11 @@ def landing_hero_image() -> FileResponse:
     return FileResponse(_SITE_DIR / "restaurant-kitchen.jpg", media_type="image/jpeg",
                         headers={"Cache-Control": "public, max-age=604800"})
 
+@app.get("/assets/demo.mp4")
+def landing_demo_video() -> FileResponse:
+    return FileResponse(_SITE_DIR / "demo.mp4", media_type="video/mp4",
+                        headers={"Cache-Control": "public, max-age=604800"})
+
 
 @app.get("/health")
 def health() -> dict:
