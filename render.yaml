@@ -22,6 +22,14 @@ services:
       # on the internet and spend AI credits, so it's off in production.
       - key: CHAT_DEMO_ENABLED
         value: 0
+      # Public restaurant self-signup (/portal/signup). Off by default; add
+      # restaurants from /admin. Set 1 only if you want open signups.
+      - key: PORTAL_SIGNUP_ENABLED
+        value: 0
+      # 1 = refuse Twilio webhooks / API calls whenever a protecting secret is
+      # missing. Turn on once /admin "Security checks" is all green.
+      - key: SECURITY_STRICT
+        value: 0
       # Clock for pickup times told to callers and in SMS receipts (else UTC).
       - key: TZ
         value: America/Chicago

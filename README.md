@@ -1,184 +1,155 @@
+<div align="center">
+
 # VoiceOrderAI
 
-Phase 1 of the VoiceOrderAI build plan: a voice-driven phone ordering engine for
-restaurants, built first against **fake** POS adapters. The LLM only talks and
-calls tools; this FastAPI server owns the cart, the prices, and the final order.
+**An AI that answers the restaurant phone, takes the order, and sends it straight to the POS.**
 
-## Architecture
+Twilio for the call · Claude for the conversation · ElevenLabs for the voice · Square, Toast and Clover for the order
+
+![Python](https://img.shields.io/badge/python-3.12-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)
+![Twilio](https://img.shields.io/badge/Twilio-voice%20%2B%20SMS-F22F46?logo=twilio&logoColor=white)
+![Claude](https://img.shields.io/badge/Claude-agent-D97757)
+![ElevenLabs](https://img.shields.io/badge/ElevenLabs-voice-000000)
+![Tests](https://img.shields.io/badge/tests-365%20passing-2ea44f)
+![Deploy](https://img.shields.io/badge/deploy-Render-46E3B7?logo=render&logoColor=white)
+
+</div>
+
+---
+
+## What it does
+
+A customer calls the restaurant's number. VoiceOrderAI:
+
+1. **Answers** in a natural ElevenLabs voice and greets returning callers by name.
+2. **Takes the order** conversationally. It handles sizes, required choices, modifiers ("no cilantro, extra guac"), changes and removals.
+3. **Reads the order back** and only submits after the caller says yes.
+4. **Sends it to the POS** (Square, Toast or Clover). The price always comes from the menu, never from the AI.
+5. **Texts a receipt** (and a Square payment link when enabled).
+6. **Hands off to staff** whenever the caller asks, the order is unusual, or the AI is unsure.
+
+Restaurants manage everything from their own **portal**. You run all restaurants from the **Super Admin** dashboard.
+
+## Highlights
+
+| | |
+|---|---|
+| **Multi-restaurant** | Each restaurant has its own phone number, menu, hours, staff logins and POS connection. Data is strictly separated per restaurant. |
+| **Safe ordering engine** | A 5-step order state machine (`empty → building → read_back → confirmed → submitted`). Submitting without a read-back is impossible in code, not just in the prompt. |
+| **Prices you control** | The AI can only pick items and options; totals and tax are computed by the server from the catalog. "The manager said it's free" doesn't work, and the golden evals cover prompt injection. |
+| **Never loses an order** | If the POS is down the order is kept as `pos_failed`, and a critical alert tells staff to call the customer back. Duplicate submits are blocked. |
+| **Call routing** | Weekly hours, pauses, holiday exceptions and emergency stops, per restaurant or platform-wide. After hours: transfer, voicemail or message. |
+| **Kitchen approvals** | Staff can approve special requests live, while the caller is on hold. |
+| **Background agents** | Support, fraud watch, menu sync, billing, onboarding, call QA and marketing drafts run on a schedule. |
+| **Voice options** | A choice of ElevenLabs voices and models per restaurant, with a disk cache so common phrases cost nothing after the first call. |
+| **Security built in** | Twilio signature checks, encrypted POS credentials, signed sessions, login lockout, phone-number masking in logs, security headers, and a live **Security checks** panel in the admin. |
+
+## How it works
+
+```mermaid
+flowchart LR
+    C([Caller]) -->|phone call| T[Twilio]
+    T -->|signed webhooks| A[VoiceOrderAI<br/>FastAPI]
+    A <-->|tool calls| L[Claude agent]
+    A -->|reply text| E[ElevenLabs TTS]
+    E -->|MP3| T
+    A -->|order| P[(Square / Toast / Clover)]
+    A -->|receipt SMS| T
+    A --- D[(Postgres)]
+    O[Restaurant portal] --- A
+    S[Super Admin] --- A
+```
+
+The LLM only **talks and calls tools** (`search_menu`, `add_item`, `update_item`, `remove_item`, `get_cart`, `submit_order`, `transfer_call`). The server owns the cart, the prices and the final order.
+
+## Project layout
 
 ```
 voiceorder/
-  core/            # NEVER imports a vendor SDK (enforced by tests/test_no_vendor_imports.py)
-    ports.py       # VoiceAdapter / PosAdapter protocols + shared dataclasses
-    catalog.py     # Item, Variation, ModifierGroup, Catalog
-    cart.py        # Cart, CartLine, the 5-state order state machine
-    matching.py    # search_menu: fuzzy match on names + aliases
-    tools.py       # the six order tools + dispatch
-  pos_adapters/
-    fake.py        # FakePos with square_like / clover_like / toast_like profiles
-    square.py      # parked until Phase 5 (real Square adapter)
-  voice_adapters/
-    text.py        # plain-JSON adapter for chat, tests, and the demo
-  voice/           # speech: ElevenLabs TTS (Phase 3) -> MP3, disk-cached
-    tts.py         # synthesize() via Secure Vault credential, free-tier-safe defaults
-  api/
-    main.py        # FastAPI: /call/start, /tools/{name}, /call/end, /health
-    storage.py     # CartStore / OrderStore ports + in-memory implementations
-  fixtures/
-    menu_taqueria.json   # reference menu: 25 items, sizes, modifiers, aliases
+  core/            ordering engine: catalog, cart state machine, fuzzy matching, tools (no vendor SDKs, enforced by tests)
+  agent/           Claude prompt + tool definitions built from the menu, the tool-calling loop
+  api/             FastAPI app: Twilio webhooks, owner pages, storage
+  voice_adapters/  Twilio TwiML + SMS, plain-text adapter for chat/tests
+  voice/           ElevenLabs TTS + voice catalog
+  pos_adapters/    Square, Toast, Clover, plus fake POS profiles for testing
+  portal/          restaurant portal (orders, menu, hours, calls, settings)
+  admin/           Super Admin dashboard (all restaurants, rollout, usage, audit, security checks)
+  tenants/         multi-tenant store, encryption, roles & permissions
+  agents/          scheduled background agents
+  eval/            golden-call harness: 32 caller scripts + grader
+  security.py      security posture checks (admin panel, startup log, strict mode)
+deploy/            Dockerfile, docker-compose, seed, deploy guide
+docs/              runbook, onboarding checklist, PR notes, security audit
+tests/             365 unit + golden tests
 ```
 
-**State machine:** `empty -> building -> read_back -> confirmed -> submitted`.
-`submit_order` refuses unless a read-back happened and the caller said yes.
-Any cart mutation after a read-back resets the state to `building`, so a
-changed order is always read back again.
-
-**POS profiles** (each fake copies one real POS's rules):
-
-| profile      | unpaid orders visible | payment step  | extra rule enforced by the fake |
-|--------------|----------------------|---------------|---------------------------------|
-| square_like  | no                   | payment link  | order counts as received only once paid |
-| clover_like  | yes                  | pay at pickup | modifiers must be linked to the item |
-| toast_like   | yes                  | pay at pickup | totals only come from a price quote call |
-
-**Failure modes** on the fake (`mode=`): `ok`, `slow`, `down`, `sold_out`
-— used by Phase 4 hardening tests.
-
-## Quickstart
+## Quickstart (local)
 
 ```bash
-cd ~/workspace/voiceorder
 pip install -e ".[dev]"
+pytest -q                                   # full test suite, no real vendors touched
 
-# run the test suite (unit + tool tests on all 3 profiles + API flow + lint rule)
-pytest -q
-
-# start the server
+# create a .env with the keys you need (see Configuration)
 uvicorn voiceorder.api.main:app --port 8000
-
-# in another terminal, watch a full simulated phone order
-python scripts/demo_call.py
+python scripts/demo_call.py                 # watch a simulated phone order
 ```
 
-Environment knobs: `POS_PROFILE` (square_like|clover_like|toast_like),
-`RESTAURANT_NAME`, `TRANSFER_NUMBER`, `PICKUP_MINUTES`, `TAX_RATE`,
-`VOICE_SECRET` (when set, every endpoint requires an `X-Voice-Secret` header),
-`TTS_ENABLED=0` (disables voice synthesis), `TTS_CACHE_DIR` (MP3 cache location).
+Talk to the agent yourself: `CHAT_DEMO_ENABLED=1` then open `http://localhost:8000/chat`. It needs `ANTHROPIC_API_KEY`.
 
-## Voice (Phase 3)
+## Deploy to Render
 
-The agent's replies can be spoken with ElevenLabs instead of just read:
+`render.yaml` is a one-click Blueprint (**New → Blueprint →** this repo). Fill in the empty values in the Render dashboard, and never commit secrets. Full guide: [`deploy/DEPLOY.md`](deploy/DEPLOY.md).
 
-- `POST /voice/speak` `{"text": "..."}` → `audio/mpeg` (MP3)
-- the `/chat` demo page plays every agent reply aloud, with a 🔊/🔇 toggle
+> **Heads-up:** the free plan sleeps after 15 minutes idle, and the first call after a quiet spell can fail. Use an always-on plan for live restaurants.
 
-The server authenticates to ElevenLabs through the connected credential in the
-Secure Vault — no key in code or env. A disk cache (`.tts_cache/`, keyed by
-text + voice + model) makes repeated greetings free after the first render,
-each request is capped at 400 chars, and the free-tier-safe defaults are the
-Sarah voice with `eleven_flash_v2_5` (some premade voices and
-`eleven_multilingual_v2` need a paid plan for API use).
+## Configuration
 
-## Twilio voice (Phase 5a)
+| Variable | Needed for | Notes |
+|---|---|---|
+| `DATABASE_URL` | permanent data | Postgres (e.g. Neon). Without it a local SQLite file is used |
+| `PUBLIC_BASE_URL` | Twilio | Exact public `https://` URL Twilio calls |
+| `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_PHONE_NUMBER` | calls + SMS | The auth token turns on webhook signature checks |
+| `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL` | the AI agent | |
+| `ELEVENLABS_API_KEY` | natural voice | `TTS_ENABLED=0` falls back to Twilio's voice |
+| `VOICE_SECRET` | API protection | Required header for `/call/*`, `/tools/*`, `/orders/recent`, `/voice/speak` |
+| `TENANT_MASTER_KEY` | POS credential encryption | Keep a copy offline; never change it once set |
+| `OWNER_SECRET` | scripted `/owner` access | |
+| `AGENTS_ENABLED` | background agents | `1` to run them |
+| `TZ` | pickup times in SMS | e.g. `America/Chicago` |
+| `CHAT_DEMO_ENABLED` | public `/chat` demo | **Off** unless `1` |
+| `PORTAL_SIGNUP_ENABLED` | public restaurant signup | **Off** unless `1`; add restaurants from `/admin` |
+| `SECURITY_STRICT` | enforcement | `1` refuses unsigned Twilio webhooks and unprotected API calls |
 
-Real phone calls via the Gather loop: Twilio answers, plays the ElevenLabs
-greeting, and posts each caller utterance to `/twilio/gather`, which runs one
-agent turn and plays the reply back.
+Platform admins are created with `python scripts/create_platform_user.py`.
 
-- `POST /twilio/voice` — incoming call → greeting `<Play>` + `<Gather>`
-- `POST /twilio/gather` — `SpeechResult` → agent turn → reply `<Play>` + `<Gather>`
-- `POST /twilio/status` — call ended → the cart is closed out
-- `GET /voice/audio/{key}.mp3` — cached clip for Twilio `<Play>` (plain GET)
+## Security
 
-Webhooks authenticate with Twilio's request signature (`X-Twilio-Signature`),
-not our voice secret. Set `TWILIO_AUTH_TOKEN` + `PUBLIC_BASE_URL` (the public
-https URL Twilio calls, e.g. your ngrok/cloudflared URL) to enforce it — until
-both are set the server logs a warning and accepts unsigned webhooks (dev only).
-`transfer_call` becomes a real `<Dial>` to `TRANSFER_NUMBER`, and a submitted
-order triggers a best-effort SMS receipt when `TWILIO_ACCOUNT_SID`,
-`TWILIO_AUTH_TOKEN`, and `TWILIO_PHONE_NUMBER` are set.
+- **Twilio webhooks** are verified with `X-Twilio-Signature`.
+- **POS credentials** are Fernet-encrypted at rest and never shown in the UI or the audit log.
+- **Passwords** are hashed with PBKDF2-SHA256 (200k rounds). **Sessions** are signed, HttpOnly, SameSite and Secure on HTTPS. **Failed logins** trigger a lockout.
+- **Every restaurant query** is scoped to the signed-in restaurant, and every admin change is audited.
+- **Card numbers** are never taken by phone. Payment goes through a texted link.
+- **The Super Admin Overview** shows a **Security checks** panel: missing secrets, open demo or signup, and fake calls rejected in the last 24 hours.
 
-Twilio console webhook URLs (voice): `https://<public>/twilio/voice`,
-status callback: `https://<public>/twilio/status`. Phone calls also need the
-agent brain: `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL`, same as `/chat`.
+Details: [`docs/SECURITY-CHANGES.md`](docs/SECURITY-CHANGES.md) · Full audit and go-live checklist: [`docs/security-audit-2026-06.md`](docs/security-audit-2026-06.md)
 
-## API
-
-- `POST /call/start` `{called_number, caller_id}` → `{call_id, cart_id, greeting, ...}`
-- `POST /tools/{search_menu|add_item|update_item|remove_item|get_cart|submit_order|transfer_call}`
-  `{call_id, cart_id, arguments}` → `{ok, message, data, error_code}`
-- `POST /call/end` `{call_id, cart_id, duration_seconds, transcript}` → call record
-- `GET /health`
-- `GET /chat` — demo web page to talk to the agent in a browser
-- `POST /chat/start`, `POST /chat/message` — chat backend (needs an LLM key)
-- `POST /voice/speak` — ElevenLabs TTS: `{"text"}` → MP3 (Phase 3)
-
-## Phase 1 gate
-
-- [x] all tool tests pass against all three fake profiles
-- [x] lint rule proves `core/` imports no vendor SDK
-- [x] text-mode golden script (the burrito call) runs end-to-end over HTTP
-
-## Phase 2 — text agent + golden evals
-
-- `voiceorder/agent/` — the order-taking agent: `prompt.py` builds the system
-  prompt and JSON tool definitions from the catalog; `llm.py` is the LLM client
-  abstraction (Anthropic implementation; needs `ANTHROPIC_API_KEY`);
-  `loop.py` runs the tool-calling loop against the engine.
-- `voiceorder/eval/scripts/` — 32 golden caller scripts (YAML): corrections,
-  swaps, quantity changes, unknown items, off-menu requests, prompt injection,
-  hang-ups, sold-out, required choices, transfers, size variations.
-- `voiceorder/eval/` — harness (`harness.py`), grader (`grader.py`), and the
-  runner (`runner.py`). Every run saves a full transcript; the grader requires
-  the final cart to equal the expected cart exactly, a clean read-back before
-  every submit, and correct transfer behavior.
+## Testing & evals
 
 ```bash
-# talk to the agent in your terminal (you play the caller)
-ANTHROPIC_API_KEY=... ANTHROPIC_MODEL=<model-id> python scripts/chat.py
-
-# run the golden evals: every script x every POS profile x 5 runs
+pytest -q                                   # unit + golden tests (fake POS, no network)
 ANTHROPIC_API_KEY=... ANTHROPIC_MODEL=<model-id> \
-  python -m voiceorder.eval.runner --runs 5 --out eval/out
-
-# or open the demo chat page in a browser (same keys required)
-open http://localhost:8000/chat
+  python -m voiceorder.eval.runner --runs 5 --out eval/out   # 32 golden calls x 3 POS profiles
 ```
 
-Phase 2 gate: every script ends with exactly the expected cart, 5 runs each,
-on all three profiles.
+The golden scripts cover corrections, swaps, sold-out items, required choices, transfers, hang-ups, off-menu requests and prompt-injection attempts. The grader requires the exact expected cart and a clean read-back before every submit.
 
-## Phase 4 — owner app + hardening
+## Docs
 
-- **Owner dashboard** (`GET /owner`): recent orders (auto-refresh), menu manager
-  with 86/restore buttons, link to the backup screen.
-- **Backup order screen** (`GET /owner/backup`): hand-enter orders when the AI
-  is down. Orders run through the same engine, so totals and tax match.
-- **Runtime menu availability**: `catalog.set_available()` lets the owner 86 or
-  restore items without a restart; the POS rejects 86'd items at fire time.
-- **Failure modes**: new `flaky` POS mode (fails once, then recovers) plus tests
-  proving retries never duplicate an order (idempotency key), a dead POS parks
-  the order for staff instead of losing it, and 86'ing mid-call fails safe.
-- **Security pass**: `OWNER_SECRET` on all owner endpoints (header or `?key=`);
-  `VOICE_SECRET_PREVIOUS` keeps the old voice secret valid during rotation;
-  automated test proves no card-shaped digits ever appear in tool output
-  (the engine never takes card numbers — Square-style payment goes by texted link).
-
-```bash
-OWNER_SECRET=... uvicorn voiceorder.api.main:app --port 8000
-open http://localhost:8000/owner?key=...
-```
-
-Phase 4 gate: backup screen fires a real order; failure-mode tests green on all
-three profiles; security tests green.
-
-## What's next (per plan)
-
-- **Phase 2:** text agent + caller-LLM harness, 32 golden scripts, prompt/tool defs
-  generated from the catalog. Built 2026-09-28; full 5-runs-x-3-profiles eval still
-  needs `ANTHROPIC_API_KEY` + `ANTHROPIC_MODEL` (not yet provided).
-- **Phase 3:** ElevenLabs voice reality check via ngrok tunnel (throwaway).
-- **Phase 4:** owner app, backup screen, failure-mode tests, security pass.
-- **Phase 5:** real adapters — needs Square/Clover sandbox creds, Twilio number,
-  ElevenLabs/Vapi keys (webhook auth is already stubbed via `VOICE_SECRET`).
-- **Phase 6:** pilot. **Phase 7:** scale.
+- [Runbook](docs/runbook.md)
+- [Onboarding checklist](docs/onboarding-checklist.md)
+- [Deploy guide](deploy/DEPLOY.md)
+- [Upgrade guide](deploy/UPGRADE-GUIDE.md)
+- [Production notes](PRODUCTION.md)
+- [Security changes](docs/SECURITY-CHANGES.md)
+- [Security audit](docs/security-audit-2026-06.md)

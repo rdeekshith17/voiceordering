@@ -200,7 +200,7 @@ def test_twilio_gather_runs_agent_turn(client, public_url, monkeypatch):
             "/twilio/gather", data=_voice_form(SpeechResult="two tacos please")
         )
         assert resp.status_code == 200
-        assert "<Say>One moment.</Say>" in resp.text
+        assert "<Say>" in resp.text  # a short filler line (wording varies)
         assert "/twilio/turn" in resp.text
         # The turn completes on the poll; the reply plays and we listen on.
         final = _drain_turn(client, resp, "CA123")

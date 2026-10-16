@@ -23,8 +23,9 @@ For whoever keeps the platform running. Production: Render web service
 | `TENANT_MASTER_KEY` | generated once | **Never change.** Encrypts POS credentials and signs logins; a new key makes saved credentials unreadable and logs everyone out |
 | `TZ` | `America/Chicago` | Fallback clock for restaurants without a time zone |
 | `AGENTS_ENABLED` | `1` | Runs the 7 background agents in the app |
-| `CHAT_DEMO_ENABLED` | `0` | The public text demo would place real POS orders; keep off in production |
-| `PORTAL_SIGNUP_ENABLED` | `1` or `0` | Public self-signup. Set `0` if restaurants are only added from `/admin` |
+| `CHAT_DEMO_ENABLED` | `0` (default) | The public text demo would place real POS orders; off unless set to `1` |
+| `PORTAL_SIGNUP_ENABLED` | `0` (default) | Public self-signup; off unless set to `1`. Add restaurants from `/admin` |
+| `SECURITY_STRICT` | `0` → `1` | `1` refuses unsigned Twilio webhooks and API calls when a protecting secret is missing. Turn on once `/admin` Security checks are green |
 | `DISABLED_FEATURES` | empty | Emergency kill switch without the database: `voice_schedule_enabled`, `hitl_enabled`, or `all` |
 | `TWILIO_AUTH_TOKEN` | from Twilio | Turns on webhook signature checks. Must be set in production |
 | `PUBLIC_BASE_URL` | `https://voiceorderai.onrender.com` | Used to build webhook URLs and check signatures |

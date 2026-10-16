@@ -25,6 +25,12 @@ os.environ.setdefault(
     "TENANT_MASTER_KEY", "mJR3GX77FPHPjJwFdiG2mHaqvs_qdwccrDkPZ_iinec="
 )
 
+# The public demo and self-signup are OFF by default in the app; the suite
+# exercises both, so it turns them on explicitly (test_security_posture.py
+# covers the off-by-default behaviour).
+os.environ.setdefault("CHAT_DEMO_ENABLED", "1")
+os.environ.setdefault("PORTAL_SIGNUP_ENABLED", "1")
+
 from pathlib import Path
 
 import pytest

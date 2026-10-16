@@ -49,6 +49,7 @@ from ..db import describe as describe_db, is_postgres
 from .. import approvals as hitl
 from .. import logsafe
 from .. import routing as call_routing
+from .. import security
 from ..core.ports import ToolResult
 from ..core.cart import CartState
 from ..core.catalog import Catalog
@@ -258,6 +259,8 @@ else:
 
 if not settings.voice_secret:
     log.warning("VOICE_SECRET is not set; endpoints accept unauthenticated local calls")
+for _problem in security.problems():
+    log.warning("security check [%s]: %s - %s", _problem.severity, _problem.label, _problem.fix)
 
 
 # --- Multi-tenancy -----------------------------------------------------------
@@ -486,6 +489,8 @@ def _voice_secrets() -> list[str]:
 
 def require_secret(x_voice_secret: str | None = Header(default=None)) -> None:
     valid = _voice_secrets()
+    if not valid and security.strict_mode():
+        raise HTTPException(status_code=503, detail="VOICE_SECRET is not set (SECURITY_STRICT=1)")
     if valid and x_voice_secret not in valid:
         raise HTTPException(status_code=401, detail="invalid voice secret")
 
@@ -533,8 +538,8 @@ app.include_router(
             build_adapter=tenant_pos_adapter,
             get_catalog=tenant_catalog,
             on_config_changed=_drop_tenant_caches,
-            # Public self-signup; turn off (0) once restaurants are added from /admin.
-            signup_enabled=os.environ.get("PORTAL_SIGNUP_ENABLED", "1") != "0",
+            # Public self-signup: off unless PORTAL_SIGNUP_ENABLED=1.
+            signup_enabled=security.signup_enabled(),
         )
     )
 )
@@ -604,8 +609,8 @@ box.addEventListener('keydown',e=>{if(e.key==='Enter')send();});
 
 def _chat_enabled() -> bool:
     """The public text demo places real orders through the restaurant's POS and
-    spends AI credits, so production turns it off (CHAT_DEMO_ENABLED=0)."""
-    return os.environ.get("CHAT_DEMO_ENABLED", "1") != "0"
+    spends AI credits, so it is off unless CHAT_DEMO_ENABLED=1."""
+    return security.chat_demo_enabled()
 
 
 # Per-visitor limit on demo chat messages: client IP -> recent message times.
@@ -801,6 +806,10 @@ def _twilio_signature_ok(request: Request, form: dict[str, str]) -> bool:
     token = os.environ.get("TWILIO_AUTH_TOKEN", "")
     public_base = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
     if not token or not public_base:
+        if security.strict_mode():
+            log.error("rejected Twilio webhook: TWILIO_AUTH_TOKEN/PUBLIC_BASE_URL not set (SECURITY_STRICT=1)")
+            _record_signature_failure(request.url.path)
+            return False
         log.warning(
             "TWILIO_AUTH_TOKEN/PUBLIC_BASE_URL not set; "
             "accepting Twilio webhook without signature validation (dev only)"

@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from .. import routing
+from .. import security
 from ..portal import ui
 from ..portal.portal import TIMEZONES, is_https
 from ..portal.ui import icon
@@ -145,6 +146,29 @@ logins use the <a href="/portal/login">restaurant portal</a>.</p>
     return ui.auth_shell("Super Admin", body, platform)
 
 
+def _rejected_webhooks(deps: AdminDeps, since: float) -> int:
+    events = deps.tenants.list_audit(None, 500, "webhook.signature_failed")
+    return sum(1 for e in events if (e.get("at") or 0) >= since)
+
+
+def _security_card(deps: AdminDeps, now: float) -> str:
+    checks = security.run_checks()
+    bad = security.problems(checks)
+    rejected = _rejected_webhooks(deps, now - 86400)
+    pill = lambda c: ('<span class="pill ok">ok</span>' if c.ok else
+                      f'<span class="pill {"bad" if c.severity in ("critical", "high") else "warn"}">{_e(c.severity)}</span>')
+    rows = "".join(
+        f'<div class="kv" data-testid="security-check-{_e(c.key)}"><span>{_e(c.label)}'
+        + ("" if c.ok else f'<br><span class="mut small">{_e(c.detail)} <b>Fix:</b> {_e(c.fix)}</span>')
+        + f'</span><b>{pill(c)}</b></div>' for c in checks)
+    head = (f'<span class="r pill {"ok" if not bad else "bad"}">'
+            f'{"all clear" if not bad else f"{len(bad)} to fix"}</span>')
+    reject = (f'<div class="kv" data-testid="security-rejected-webhooks"><span>Fake or unsigned calls rejected (24 h)'
+              f'</span><b><span class="pill {"warn" if rejected else "ok"}">{rejected}</span></b></div>')
+    return (f'<div class="card" style="margin-top:28px" data-testid="security-card"><div class="card-h">'
+            f'<h3>Security checks</h3>{head}</div><div class="card-b">{reject}{rows}</div></div>')
+
+
 def _overview(deps: AdminDeps, admin: PlatformUser) -> str:
     s, now = deps.tenants, time.time()
     tenants = s.list_tenants(active_only=False)
@@ -194,7 +218,7 @@ def _overview(deps: AdminDeps, admin: PlatformUser) -> str:
                       f'<a href="/admin/restaurants/{_e(t.id)}">Open</a></b></div>'
                       for t in tenants if tickets.get(t.id))
             + ('' if any(tickets.get(t.id) for t in tenants) else '<p class="mut">Nothing right now.</p>')
-            + "</div></div></div>")
+            + "</div></div></div>" + _security_card(deps, now))
     return _shell(deps, admin, "overview", "Overview", body)
 
 
@@ -652,5 +676,13 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                 "platform_emergency": s.platform_emergency(),
                 "pending_approvals": len(s.platform_pending_approvals()),
                 "jobs": s.job_status(), "as_of": now}
+
+    @router.get("/admin/api/security")
+    async def security_status(request: Request):
+        api_admin(request, "diagnostics.view")
+        checks = security.run_checks()
+        return {"ok": not security.problems(checks), "strict": security.strict_mode(),
+                "rejected_webhooks_24h": _rejected_webhooks(deps, time.time() - 86400),
+                "checks": [c.to_dict() for c in checks]}
 
     return router
